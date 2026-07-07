@@ -1,0 +1,22 @@
+[package]
+name = "photo-editor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+image = "0.25"
+rawler = "0.7"
+rayon = "1.10"
+rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# Pixel processing is unusably slow without optimization, even in dev builds.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3
