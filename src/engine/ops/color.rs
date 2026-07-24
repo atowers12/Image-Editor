@@ -10,6 +10,22 @@ pub fn white_balance_gains(temp: f32, tint: f32) -> (f32, f32, f32) {
     (r, g, b)
 }
 
+/// Given a sampled linear RGB that should be neutral gray, solve for the
+/// (temp, tint) slider values in -100..=100 that neutralize it — the
+/// white-balance eyedropper. Inverts `white_balance_gains`.
+pub fn neutral_to_temp_tint(rgb: [f32; 3]) -> (f32, f32) {
+    let eps = 1e-4;
+    let lr = rgb[0].max(eps).log2();
+    let lg = rgb[1].max(eps).log2();
+    let lb = rgb[2].max(eps).log2();
+    // From white_balance_gains, requiring r*gr = g*gg = b*gb:
+    //   temp_norm = (B - R) / 0.70
+    //   tint_norm = (2G - R - B) / 0.70
+    let temp = ((lb - lr) / 0.70 * 100.0).clamp(-100.0, 100.0);
+    let tint = ((2.0 * lg - lr - lb) / 0.70 * 100.0).clamp(-100.0, 100.0);
+    (temp, tint)
+}
+
 /// Uniform saturation scale around luma. `amount` -1..=1.
 #[inline]
 pub fn saturate(px: &mut [f32], l: f32, amount: f32) {
@@ -95,6 +111,25 @@ mod tests {
             assert!((g - g2).abs() < 1e-4, "{g} vs {g2}");
             assert!((b - b2).abs() < 1e-4, "{b} vs {b2}");
         }
+    }
+
+    #[test]
+    fn eyedropper_neutralizes_sampled_color() {
+        // A bluish pixel: applying the solved gains should equalize channels.
+        let sample = [0.3f32, 0.35, 0.5];
+        let (temp, tint) = neutral_to_temp_tint(sample);
+        let (gr, gg, gb) = white_balance_gains(temp / 100.0, tint / 100.0);
+        let (r, g, b) = (sample[0] * gr, sample[1] * gg, sample[2] * gb);
+        assert!((r - g).abs() < 0.02, "{r} vs {g}");
+        assert!((g - b).abs() < 0.02, "{g} vs {b}");
+        // Bluish input should push temp warm (positive).
+        assert!(temp > 0.0);
+    }
+
+    #[test]
+    fn neutral_gray_needs_no_correction() {
+        let (temp, tint) = neutral_to_temp_tint([0.5, 0.5, 0.5]);
+        assert!(temp.abs() < 1.0 && tint.abs() < 1.0);
     }
 
     #[test]

@@ -1,4 +1,11 @@
 pub mod adjustments;
+pub mod crop;
+pub mod curve;
 pub mod export_dialog;
 pub mod filmstrip;
+pub mod histogram;
+pub mod info;
+pub mod masks;
 pub mod preview;
+pub mod settings;
+pub mod welcome;

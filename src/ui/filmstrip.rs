@@ -4,11 +4,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::engine::params::Flag;
+
 pub fn show(
     ui: &mut egui::Ui,
     files: &[PathBuf],
     selected: Option<usize>,
     thumbs: &HashMap<PathBuf, egui::TextureHandle>,
+    meta: &HashMap<PathBuf, (u8, Flag)>,
 ) -> Option<usize> {
     let mut clicked = None;
     egui::ScrollArea::vertical()
@@ -74,6 +77,38 @@ pub fn show(
                         label_text.weak()
                     };
                     ui.add(egui::Label::new(label_text).truncate());
+
+                    // Rating / flag badges for culling.
+                    if let Some((rating, flag)) = meta.get(path) {
+                        if *rating > 0 || *flag != Flag::None {
+                            ui.horizontal(|ui| {
+                                match flag {
+                                    Flag::Pick => {
+                                        ui.label(
+                                            egui::RichText::new("⚑")
+                                                .small()
+                                                .color(egui::Color32::from_rgb(120, 200, 120)),
+                                        );
+                                    }
+                                    Flag::Reject => {
+                                        ui.label(
+                                            egui::RichText::new("⚐")
+                                                .small()
+                                                .color(egui::Color32::from_rgb(230, 110, 110)),
+                                        );
+                                    }
+                                    Flag::None => {}
+                                }
+                                if *rating > 0 {
+                                    ui.label(
+                                        egui::RichText::new("★".repeat(*rating as usize))
+                                            .small()
+                                            .color(egui::Color32::from_rgb(240, 200, 90)),
+                                    );
+                                }
+                            });
+                        }
+                    }
                     ui.add_space(6.0);
                 });
             }

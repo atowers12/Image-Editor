@@ -1,4 +1,5 @@
-//! Export settings modal: format + JPEG quality, then a native save dialog.
+//! Export settings modal: scope (current photo / whole folder), format,
+//! and JPEG quality; the app follows up with a native save/folder dialog.
 
 use crate::imgio::export::ExportFormat;
 
@@ -6,6 +7,7 @@ pub struct ExportDialog {
     pub open: bool,
     pub format: ExportFormat,
     pub jpeg_quality: u8,
+    pub batch: bool,
 }
 
 impl Default for ExportDialog {
@@ -14,6 +16,7 @@ impl Default for ExportDialog {
             open: false,
             format: ExportFormat::Jpeg,
             jpeg_quality: 90,
+            batch: false,
         }
     }
 }
@@ -21,12 +24,14 @@ impl Default for ExportDialog {
 pub struct ExportRequest {
     pub format: ExportFormat,
     pub jpeg_quality: u8,
+    pub batch: bool,
 }
 
 impl ExportDialog {
     /// Returns Some when the user confirms; the caller then picks the
     /// destination with a native dialog and hands off to the worker.
-    pub fn show(&mut self, ctx: &egui::Context) -> Option<ExportRequest> {
+    /// `folder_count` is how many photos a batch would cover.
+    pub fn show(&mut self, ctx: &egui::Context, folder_count: usize) -> Option<ExportRequest> {
         if !self.open {
             return None;
         }
@@ -38,6 +43,13 @@ impl ExportDialog {
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
+                ui.radio_value(&mut self.batch, false, "Current photo");
+                ui.radio_value(
+                    &mut self.batch,
+                    true,
+                    format!("All {folder_count} photos in folder (each with its own edits)"),
+                );
+                ui.add_space(6.0);
                 egui::ComboBox::from_label("Format")
                     .selected_text(self.format.label())
                     .show_ui(ui, |ui| {
@@ -46,16 +58,20 @@ impl ExportDialog {
                         }
                     });
                 if self.format == ExportFormat::Jpeg {
-                    ui.add(
-                        egui::Slider::new(&mut self.jpeg_quality, 10..=100).text("Quality"),
-                    );
+                    ui.add(egui::Slider::new(&mut self.jpeg_quality, 10..=100).text("Quality"));
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Choose destination…").clicked() {
+                    let label = if self.batch {
+                        "Choose folder…"
+                    } else {
+                        "Choose destination…"
+                    };
+                    if ui.button(label).clicked() {
                         result = Some(ExportRequest {
                             format: self.format,
                             jpeg_quality: self.jpeg_quality,
+                            batch: self.batch,
                         });
                     }
                     if ui.button("Cancel").clicked() {

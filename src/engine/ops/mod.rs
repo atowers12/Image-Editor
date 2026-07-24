@@ -1,5 +1,10 @@
 pub mod color;
+pub mod curve;
 pub mod detail;
+pub mod geometry;
 pub mod hsl;
+pub mod local;
+pub mod mask;
+pub mod sharpen;
 pub mod tone;
 pub mod vignette;
