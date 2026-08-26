@@ -1,6 +1,6 @@
 # Photo Editor
 
-A Lightroom-style photo editor written in Rust, using [egui/eframe](https://github.com/emilk/egui)
+A light, portable, photo editor written in Rust, using [egui/eframe](https://github.com/emilk/egui)
 for the interface. Non-destructive by design: your original files are never modified.
 
 ## Features
