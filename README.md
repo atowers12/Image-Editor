@@ -1,7 +1,7 @@
 # Photo Editor
 
 A light, portable, photo editor written in Rust, using [egui/eframe](https://github.com/emilk/egui)
-for the interface. Non-destructive by design: your original files are never modified.
+for the interface. This project is made to be extended, full source code is available here. If you have any additions you would like to see - fork the repo and add them! Non-destructive by design: your original files are never modified.
 
 ## Features
 
