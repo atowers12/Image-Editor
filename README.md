@@ -60,6 +60,8 @@ for the interface. Non-destructive by design: your original files are never modi
 - **Export**: bakes the edits into a new full-resolution file — JPEG (adjustable
   quality), PNG, or TIFF
 
+See [TODO.md](TODO.md) for what's shipped from the roadmap and what's still open.
+
 ## Building and running
 
 Requires Rust (via [rustup](https://rustup.rs)) and, on Windows, the MSVC build tools.
