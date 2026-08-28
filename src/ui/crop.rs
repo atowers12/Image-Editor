@@ -184,10 +184,7 @@ pub fn panel(
     ui.add_space(12.0);
     ui.separator();
     ui.horizontal(|ui| {
-        if ui
-            .button(egui::RichText::new("✔ Done").strong())
-            .clicked()
-        {
+        if ui.button(egui::RichText::new("✔ Done").strong()).clicked() {
             action = CropAction::Done;
         }
         if ui.button("Reset").clicked() {
@@ -198,9 +195,11 @@ pub fn panel(
     });
     ui.add_space(6.0);
     ui.label(
-        egui::RichText::new("Drag the corners or edges of the frame in the preview; drag inside to move it.")
-            .small()
-            .weak(),
+        egui::RichText::new(
+            "Drag the corners or edges of the frame in the preview; drag inside to move it.",
+        )
+        .small()
+        .weak(),
     );
 
     action

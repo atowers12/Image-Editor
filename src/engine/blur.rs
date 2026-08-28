@@ -31,7 +31,8 @@ fn box_blur_rows(src: &[f32], dst: &mut [f32], w: usize, h: usize, radius: usize
             }
             for x in 0..w {
                 drow[x] = acc * norm;
-                acc += clamp(x as isize + radius as isize + 1) - clamp(x as isize - radius as isize);
+                acc +=
+                    clamp(x as isize + radius as isize + 1) - clamp(x as isize - radius as isize);
             }
         });
     let _ = h;

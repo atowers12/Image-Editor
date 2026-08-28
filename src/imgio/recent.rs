@@ -6,8 +6,7 @@ use std::path::PathBuf;
 const MAX_RECENT: usize = 8;
 
 fn path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
-        .map(|a| PathBuf::from(a).join("photo-editor").join("recent.json"))
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("photo-editor").join("recent.json"))
 }
 
 pub fn load() -> Vec<PathBuf> {

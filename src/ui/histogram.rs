@@ -23,9 +23,18 @@ pub fn show(
         let plot = rect.shrink(6.0);
         let cols = plot.width().max(1.0) as usize;
         let channels: [(&[u32], egui::Color32); 3] = [
-            (&h.r, egui::Color32::from_rgba_unmultiplied(235, 80, 80, 130)),
-            (&h.g, egui::Color32::from_rgba_unmultiplied(90, 210, 90, 130)),
-            (&h.b, egui::Color32::from_rgba_unmultiplied(90, 130, 245, 130)),
+            (
+                &h.r,
+                egui::Color32::from_rgba_unmultiplied(235, 80, 80, 130),
+            ),
+            (
+                &h.g,
+                egui::Color32::from_rgba_unmultiplied(90, 210, 90, 130),
+            ),
+            (
+                &h.b,
+                egui::Color32::from_rgba_unmultiplied(90, 130, 245, 130),
+            ),
         ];
         for (bins, color) in channels {
             for cx in 0..cols {
@@ -100,7 +109,11 @@ fn clip_toggle(
     };
     painter.circle_filled(rect.center(), 4.5, fill);
     if resp.hovered() {
-        painter.circle_stroke(rect.center(), 6.0, egui::Stroke::new(1.0, egui::Color32::from_gray(160)));
+        painter.circle_stroke(
+            rect.center(),
+            6.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(160)),
+        );
     }
     if resp.clicked() {
         *on = !*on;

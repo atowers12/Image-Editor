@@ -68,8 +68,7 @@ pub fn export(
             let file = std::fs::File::create(dest)
                 .with_context(|| format!("cannot create {}", dest.display()))?;
             let writer = std::io::BufWriter::new(file);
-            let encoder =
-                image::codecs::jpeg::JpegEncoder::new_with_quality(writer, jpeg_quality);
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(writer, jpeg_quality);
             img.write_with_encoder(encoder)
                 .with_context(|| format!("failed to encode JPEG {}", dest.display()))?;
         }

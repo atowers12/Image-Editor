@@ -10,13 +10,18 @@ use anyhow::{Context, Result};
 use crate::engine::params::EditParams;
 
 fn dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA")
-        .map(|a| PathBuf::from(a).join("photo-editor").join("presets"))
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("photo-editor").join("presets"))
 }
 
 fn sanitize(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect::<String>()
         .trim()
         .to_string()
@@ -42,7 +47,11 @@ pub fn list() -> Vec<String> {
             entries
                 .filter_map(|e| e.ok())
                 .filter(|e| e.path().extension().map(|x| x == "json").unwrap_or(false))
-                .filter_map(|e| e.path().file_stem().map(|s| s.to_string_lossy().to_string()))
+                .filter_map(|e| {
+                    e.path()
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                })
                 .collect()
         })
         .unwrap_or_default();

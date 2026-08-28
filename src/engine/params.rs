@@ -92,9 +92,14 @@ pub struct LocalAdjust {
     pub blacks: f32,
     pub temp: f32,
     pub tint: f32,
+    pub vibrance: f32,
     pub saturation: f32,
+    pub texture: f32,
     pub clarity: f32,
+    pub dehaze: f32,
     pub sharpness: f32,
+    /// Luminance noise reduction, 0..=100 (negative values do nothing).
+    pub noise: f32,
 }
 
 impl LocalAdjust {
@@ -104,15 +109,22 @@ impl LocalAdjust {
 }
 
 /// One brush stamp (dab). Position/radius normalized to the image.
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Dab {
     pub p: [f32; 2],
     pub radius: f32,
     pub hardness: f32,
     pub erase: bool,
+    /// Auto-mask reference: the gamma-space RGB under the dab when it was
+    /// painted. When set, the dab only covers pixels of a similar color, so
+    /// a stroke stops at edges instead of spilling across them. Captured at
+    /// paint time (rather than sampled at render time) so the same stroke
+    /// resolves identically in the preview, a zoomed region, and the export.
+    pub auto: Option<[f32; 3]>,
 }
 
-/// The geometry of a mask.
+/// The geometry of a mask component.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum MaskKind {
     /// Linear gradient: full effect past `p1`, zero before `p0`, ramped between.
@@ -136,14 +148,140 @@ impl MaskKind {
             MaskKind::Brush { .. } => "Brush",
         }
     }
+
+    /// A radial covering the middle of the frame — the default new shape.
+    pub fn default_radial() -> Self {
+        MaskKind::Radial {
+            center: [0.5, 0.5],
+            radius: [0.3, 0.3],
+            feather: 0.5,
+        }
+    }
 }
 
-/// A local adjustment mask: geometry + the adjustments it applies.
+/// How a mask component combines with the coverage of the components above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MaskOp {
+    /// Union: this shape adds to what is already covered.
+    #[default]
+    Add,
+    /// This shape is cut out of what is already covered.
+    Subtract,
+    /// Only what both this shape and the coverage so far select survives.
+    Intersect,
+}
+
+impl MaskOp {
+    pub fn label(&self) -> &'static str {
+        match self {
+            MaskOp::Add => "Add",
+            MaskOp::Subtract => "Subtract",
+            MaskOp::Intersect => "Intersect",
+        }
+    }
+
+    /// Single-character prefix used in the mask's one-line summary.
+    pub fn sigil(&self) -> &'static str {
+        match self {
+            MaskOp::Add => "+",
+            MaskOp::Subtract => "−",
+            MaskOp::Intersect => "∩",
+        }
+    }
+
+    /// Fold a component's coverage `c` into the weight accumulated so far.
+    #[inline]
+    pub fn combine(&self, w: f32, c: f32) -> f32 {
+        match self {
+            MaskOp::Add => w + c - w * c, // over-composite: never exceeds 1
+            MaskOp::Subtract => w * (1.0 - c),
+            MaskOp::Intersect => w * c,
+        }
+    }
+}
+
+/// One shape inside a mask, plus how it combines with the shapes above it.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct MaskComponent {
+    pub kind: MaskKind,
+    pub op: MaskOp,
+    pub inverted: bool,
+}
+
+impl Default for MaskComponent {
+    fn default() -> Self {
+        Self {
+            kind: MaskKind::default_radial(),
+            op: MaskOp::Add,
+            inverted: false,
+        }
+    }
+}
+
+impl MaskComponent {
+    pub fn new(kind: MaskKind, op: MaskOp) -> Self {
+        Self {
+            kind,
+            op,
+            inverted: false,
+        }
+    }
+}
+
+/// Content-based refinement of a mask: keep only the pixels that fall inside
+/// a luminance band and/or near a target hue. Both halves are off by default,
+/// so a default `RangeMask` lets every pixel through.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RangeMask {
+    pub lum_enabled: bool,
+    /// Luminance band kept at full strength (0..1).
+    pub lum_lo: f32,
+    pub lum_hi: f32,
+    /// Falloff either side of the band, in luminance units.
+    pub lum_feather: f32,
+    pub color_enabled: bool,
+    /// Target hue in degrees (0..360).
+    pub hue: f32,
+    /// Hue distance kept at full strength, in degrees.
+    pub hue_width: f32,
+    /// Falloff beyond `hue_width`, in degrees.
+    pub hue_feather: f32,
+    /// Pixels less saturated than this are too gray to have a usable hue.
+    pub sat_min: f32,
+}
+
+impl Default for RangeMask {
+    fn default() -> Self {
+        Self {
+            lum_enabled: false,
+            lum_lo: 0.0,
+            lum_hi: 1.0,
+            lum_feather: 0.10,
+            color_enabled: false,
+            hue: 0.0,
+            hue_width: 25.0,
+            hue_feather: 20.0,
+            sat_min: 0.10,
+        }
+    }
+}
+
+impl RangeMask {
+    pub fn is_active(&self) -> bool {
+        self.lum_enabled || self.color_enabled
+    }
+}
+
+/// A local adjustment mask: one or more shapes composed together, optionally
+/// narrowed by a range mask, plus the adjustments it applies.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "MaskRepr")]
 pub struct Mask {
     pub name: String,
-    pub kind: MaskKind,
+    pub components: Vec<MaskComponent>,
+    pub range: RangeMask,
     pub adjust: LocalAdjust,
     pub enabled: bool,
     pub inverted: bool,
@@ -153,14 +291,92 @@ impl Default for Mask {
     fn default() -> Self {
         Self {
             name: "Mask".into(),
-            kind: MaskKind::Radial {
-                center: [0.5, 0.5],
-                radius: [0.3, 0.3],
-                feather: 0.5,
-            },
+            components: vec![MaskComponent::default()],
+            range: RangeMask::default(),
             adjust: LocalAdjust::default(),
             enabled: true,
             inverted: false,
+        }
+    }
+}
+
+impl Mask {
+    /// Does this mask select anything at all? A mask with no shapes still
+    /// selects the whole frame when a range mask narrows it down, which is
+    /// how you target "every green pixel" without drawing anything.
+    pub fn has_selection(&self) -> bool {
+        !self.components.is_empty() || self.range.is_active()
+    }
+
+    /// One-line description of the composition, e.g. `Radial − Brush`.
+    pub fn summary(&self) -> String {
+        if self.components.is_empty() {
+            return if self.range.is_active() {
+                "Range".into()
+            } else {
+                "Empty".into()
+            };
+        }
+        let mut s = String::new();
+        for (i, c) in self.components.iter().enumerate() {
+            if i > 0 {
+                s.push(' ');
+                s.push_str(c.op.sigil());
+                s.push(' ');
+            }
+            s.push_str(c.kind.type_name());
+        }
+        if self.range.is_active() {
+            s.push_str(" · Range");
+        }
+        s
+    }
+}
+
+/// On-disk shape of a `Mask`. Masks used to hold a single `kind` instead of a
+/// component list; keeping that field here lets pre-composition sidecars load
+/// unchanged — the old shape becomes the mask's first component.
+#[derive(Deserialize)]
+#[serde(default)]
+struct MaskRepr {
+    name: String,
+    components: Vec<MaskComponent>,
+    kind: Option<MaskKind>,
+    range: RangeMask,
+    adjust: LocalAdjust,
+    enabled: bool,
+    inverted: bool,
+}
+
+impl Default for MaskRepr {
+    fn default() -> Self {
+        Self {
+            name: "Mask".into(),
+            components: Vec::new(),
+            kind: None,
+            range: RangeMask::default(),
+            adjust: LocalAdjust::default(),
+            enabled: true,
+            inverted: false,
+        }
+    }
+}
+
+impl From<MaskRepr> for Mask {
+    fn from(r: MaskRepr) -> Self {
+        let mut components = r.components;
+        if components.is_empty() {
+            if let Some(kind) = r.kind {
+                components.push(MaskComponent::new(kind, MaskOp::Add));
+            }
+        }
+        Mask {
+            name: r.name,
+            components,
+            range: r.range,
+            adjust: r.adjust,
+            enabled: r.enabled,
+            inverted: r.inverted,
         }
     }
 }
@@ -217,7 +433,7 @@ pub struct EditParams {
     pub rotate90: u8, // quarter turns clockwise, 0..=3
     pub flip_h: bool,
     pub flip_v: bool,
-    pub angle: f32, // straighten, degrees, -45..=45
+    pub angle: f32,     // straighten, degrees, -45..=45
     pub crop: [f32; 4], // x, y, w, h normalized to the oriented image
     // Metadata (not a pixel edit, but persisted alongside)
     pub rating: u8, // 0..=5
@@ -290,7 +506,7 @@ impl EditParams {
     pub fn active_masks(&self) -> impl Iterator<Item = &Mask> {
         self.masks
             .iter()
-            .filter(|m| m.enabled && !m.adjust.is_zero())
+            .filter(|m| m.enabled && !m.adjust.is_zero() && m.has_selection())
     }
 
     pub fn has_masks(&self) -> bool {
@@ -455,5 +671,111 @@ mod tests {
         p.masks[0].enabled = true;
         p.masks[0].adjust = LocalAdjust::default();
         assert_eq!(p.active_masks().count(), 0);
+    }
+
+    #[test]
+    fn a_mask_with_no_shapes_is_active_only_with_a_range() {
+        let mut p = EditParams::default();
+        let mut m = Mask::default();
+        m.adjust.exposure = 30.0;
+        m.components.clear();
+        p.masks.push(m);
+        assert_eq!(p.active_masks().count(), 0);
+        p.masks[0].range.color_enabled = true;
+        assert_eq!(p.active_masks().count(), 1);
+    }
+
+    #[test]
+    fn mask_op_combine_semantics() {
+        // Add is a union that saturates at 1 rather than exceeding it.
+        assert!((MaskOp::Add.combine(0.5, 0.5) - 0.75).abs() < 1e-6);
+        assert!(MaskOp::Add.combine(1.0, 1.0) <= 1.0);
+        // Subtract cuts away, Intersect keeps the overlap.
+        assert!((MaskOp::Subtract.combine(1.0, 0.25) - 0.75).abs() < 1e-6);
+        assert!((MaskOp::Intersect.combine(0.5, 0.5) - 0.25).abs() < 1e-6);
+        // Subtracting nothing / intersecting everything are identities.
+        assert!((MaskOp::Subtract.combine(0.6, 0.0) - 0.6).abs() < 1e-6);
+        assert!((MaskOp::Intersect.combine(0.6, 1.0) - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn legacy_sidecar_kind_becomes_first_component() {
+        // Sidecars written before mask composition stored a single `kind`.
+        let json = r#"{
+            "masks": [{
+                "name": "Sky",
+                "kind": { "Linear": { "p0": [0.5, 0.8], "p1": [0.5, 0.2] } },
+                "adjust": { "exposure": -40.0 },
+                "enabled": true,
+                "inverted": true
+            }]
+        }"#;
+        let p: EditParams = serde_json::from_str(json).unwrap();
+        assert_eq!(p.masks.len(), 1);
+        let m = &p.masks[0];
+        assert_eq!(m.name, "Sky");
+        assert_eq!(m.components.len(), 1);
+        assert_eq!(m.components[0].kind.type_name(), "Linear");
+        assert_eq!(m.components[0].op, MaskOp::Add);
+        assert!(m.inverted);
+        assert_eq!(m.adjust.exposure, -40.0);
+        // New fields come up at their defaults.
+        assert!(!m.range.is_active());
+        assert_eq!(m.adjust.noise, 0.0);
+    }
+
+    #[test]
+    fn composed_mask_round_trips() {
+        let mut p = EditParams::default();
+        let mut m = Mask::default();
+        m.components.push(MaskComponent::new(
+            MaskKind::Brush { dabs: vec![] },
+            MaskOp::Subtract,
+        ));
+        m.components.push(MaskComponent {
+            kind: MaskKind::Linear {
+                p0: [0.0, 0.0],
+                p1: [1.0, 1.0],
+            },
+            op: MaskOp::Intersect,
+            inverted: true,
+        });
+        m.range.color_enabled = true;
+        m.range.hue = 210.0;
+        m.adjust.noise = 60.0;
+        m.adjust.dehaze = -20.0;
+        p.masks.push(m);
+        let json = serde_json::to_string(&p).unwrap();
+        let back: EditParams = serde_json::from_str(&json).unwrap();
+        assert!(p == back);
+        assert_eq!(back.masks[0].components.len(), 3);
+    }
+
+    #[test]
+    fn summary_describes_the_composition() {
+        let mut m = Mask::default(); // one radial
+        assert_eq!(m.summary(), "Radial");
+        m.components.push(MaskComponent::new(
+            MaskKind::Brush { dabs: vec![] },
+            MaskOp::Subtract,
+        ));
+        assert_eq!(m.summary(), "Radial − Brush");
+        m.range.lum_enabled = true;
+        assert_eq!(m.summary(), "Radial − Brush · Range");
+        m.components.clear();
+        assert_eq!(m.summary(), "Range");
+    }
+
+    #[test]
+    fn dab_without_auto_field_still_loads() {
+        // Brush dabs gained an `auto` reference color; old ones lack it.
+        let json = r#"{"masks":[{"name":"m","components":[{"kind":{"Brush":{"dabs":[
+            {"p":[0.5,0.5],"radius":0.1,"hardness":0.5,"erase":false}]}},"op":"Add"}]}]}"#;
+        let p: EditParams = serde_json::from_str(json).unwrap();
+        let MaskKind::Brush { dabs } = &p.masks[0].components[0].kind else {
+            panic!("expected a brush component");
+        };
+        assert_eq!(dabs.len(), 1);
+        assert!(dabs[0].auto.is_none());
     }
 }

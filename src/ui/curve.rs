@@ -13,8 +13,16 @@ pub fn show(ui: &mut egui::Ui, params: &mut EditParams, channel: &mut CurveChann
         for (ch, label, color) in [
             (CurveChannel::Master, "RGB", egui::Color32::GRAY),
             (CurveChannel::Red, "R", egui::Color32::from_rgb(230, 90, 90)),
-            (CurveChannel::Green, "G", egui::Color32::from_rgb(90, 210, 90)),
-            (CurveChannel::Blue, "B", egui::Color32::from_rgb(110, 150, 245)),
+            (
+                CurveChannel::Green,
+                "G",
+                egui::Color32::from_rgb(90, 210, 90),
+            ),
+            (
+                CurveChannel::Blue,
+                "B",
+                egui::Color32::from_rgb(110, 150, 245),
+            ),
         ] {
             let selected = *channel == ch;
             if ui
@@ -27,7 +35,11 @@ pub fn show(ui: &mut egui::Ui, params: &mut EditParams, channel: &mut CurveChann
                 *channel = ch;
             }
         }
-        if ui.small_button("Reset").on_hover_text("Reset this channel").clicked() {
+        if ui
+            .small_button("Reset")
+            .on_hover_text("Reset this channel")
+            .clicked()
+        {
             *pts_mut(params, *channel) = crate::engine::params::identity_curve();
             changed = true;
         }
@@ -43,13 +55,23 @@ pub fn show(ui: &mut egui::Ui, params: &mut EditParams, channel: &mut CurveChann
     for i in 1..4 {
         let fx = rect.min.x + rect.width() * i as f32 / 4.0;
         let fy = rect.min.y + rect.height() * i as f32 / 4.0;
-        painter.line_segment([egui::pos2(fx, rect.min.y), egui::pos2(fx, rect.max.y)], grid);
-        painter.line_segment([egui::pos2(rect.min.x, fy), egui::pos2(rect.max.x, fy)], grid);
+        painter.line_segment(
+            [egui::pos2(fx, rect.min.y), egui::pos2(fx, rect.max.y)],
+            grid,
+        );
+        painter.line_segment(
+            [egui::pos2(rect.min.x, fy), egui::pos2(rect.max.x, fy)],
+            grid,
+        );
     }
 
     // Map between curve space (0..1, y up) and screen space.
-    let to_screen =
-        |x: f32, y: f32| egui::pos2(rect.min.x + x * rect.width(), rect.max.y - y * rect.height());
+    let to_screen = |x: f32, y: f32| {
+        egui::pos2(
+            rect.min.x + x * rect.width(),
+            rect.max.y - y * rect.height(),
+        )
+    };
     let to_curve = |p: egui::Pos2| {
         (
             ((p.x - rect.min.x) / rect.width()).clamp(0.0, 1.0),

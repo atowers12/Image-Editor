@@ -59,7 +59,15 @@ fn import_edit_export_round_trip() {
     let expected_dims = geometry::oriented_dims(200, 120, &params, true);
     assert_eq!((geo.width, geo.height), expected_dims);
 
-    export::export(&geo, &params, &tuning, &out_path, export::ExportFormat::Jpeg, 90).unwrap();
+    export::export(
+        &geo,
+        &params,
+        &tuning,
+        &out_path,
+        export::ExportFormat::Jpeg,
+        90,
+    )
+    .unwrap();
     let exported = image::open(&out_path).unwrap();
     // rotate90 swaps dims (200x120 -> 120x200), crop takes 80%: 96x160.
     assert_eq!(exported.width(), 96);
@@ -129,7 +137,9 @@ fn batch_export_whole_folder() {
 
 #[test]
 fn advanced_edits_export_end_to_end() {
-    use photo_editor::engine::params::{LocalAdjust, Mask, MaskKind};
+    use photo_editor::engine::params::{
+        Dab, LocalAdjust, Mask, MaskComponent, MaskKind, MaskOp,
+    };
 
     let dir = std::env::temp_dir().join("photo-editor-e2e-advanced");
     std::fs::create_dir_all(&dir).unwrap();
@@ -142,33 +152,59 @@ fn advanced_edits_export_end_to_end() {
     img.save(&src_path).unwrap();
     let src = loader::load(&src_path).unwrap();
 
-    // Curve + sharpen + noise reduction + a radial local mask.
+    // Curve + sharpen + noise reduction, plus a composed local mask: a
+    // radial with an auto-masked brush carved out of it, narrowed by a
+    // color range, driving every local slider including the new ones.
     let mut p = EditParams::default();
     p.curve.master = vec![[0.0, 0.0], [0.4, 0.55], [1.0, 1.0]];
     p.sharpen = 40.0;
     p.luminance_nr = 20.0;
     p.color_nr = 20.0;
-    p.masks.push(Mask {
+    let mut mask = Mask {
         name: "center".into(),
-        kind: MaskKind::Radial {
-            center: [0.5, 0.5],
-            radius: [0.3, 0.3],
-            feather: 0.5,
-        },
+        components: vec![
+            MaskComponent::new(MaskKind::default_radial(), MaskOp::Add),
+            MaskComponent::new(
+                MaskKind::Brush {
+                    dabs: vec![Dab {
+                        p: [0.4, 0.4],
+                        radius: 0.15,
+                        hardness: 0.6,
+                        erase: false,
+                        auto: Some([0.4, 0.5, 0.5]),
+                    }],
+                },
+                MaskOp::Subtract,
+            ),
+        ],
         adjust: LocalAdjust {
             exposure: 60.0,
+            texture: 30.0,
+            dehaze: 25.0,
+            vibrance: 40.0,
+            noise: 35.0,
             ..LocalAdjust::default()
         },
-        enabled: true,
-        inverted: false,
-    });
+        ..Mask::default()
+    };
+    mask.range.color_enabled = true;
+    mask.range.hue = 210.0;
+    p.masks.push(mask);
 
     // Sidecar round-trip must preserve curve + masks.
     sidecar::save(&src_path, &p).unwrap();
     assert!(sidecar::load(&src_path).unwrap() == p);
 
     // Export succeeds and differs from an unedited export.
-    export::export(&src, &p, &Tuning::default(), &out_path, export::ExportFormat::Png, 90).unwrap();
+    export::export(
+        &src,
+        &p,
+        &Tuning::default(),
+        &out_path,
+        export::ExportFormat::Png,
+        90,
+    )
+    .unwrap();
     let edited = image::open(&out_path).unwrap();
     assert_eq!((edited.width(), edited.height()), (120, 90));
 

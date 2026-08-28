@@ -32,12 +32,14 @@ pub enum Cmd {
         clip: ClipFlags,
     },
     /// Re-render the preview. `include_crop = false` while the crop tool is
-    /// open, so the whole frame stays visible.
+    /// open, so the whole frame stays visible. `overlay` is the index of a
+    /// mask whose coverage should be washed over the preview in red.
     Render {
         params: EditParams,
         tuning: Tuning,
         include_crop: bool,
         clip: ClipFlags,
+        overlay: Option<usize>,
     },
     /// Render a zoomed-in region of the full-resolution image.
     /// `norm_rect` is (x, y, w, h) normalized to the geometry-applied image.
@@ -72,7 +74,10 @@ pub enum Reply {
         exif: ExifInfo,
     },
     /// Result of a white-balance eyedropper sample.
-    Neutral { temp: f32, tint: f32 },
+    Neutral {
+        temp: f32,
+        tint: f32,
+    },
     Preview {
         width: usize,
         height: usize,
@@ -82,6 +87,9 @@ pub enum Reply {
         full_size: (usize, usize),
         /// Channel histogram of the render (computed before clip marking).
         histogram: Histogram,
+        /// Coverage of the mask being edited, one byte per pixel, when the
+        /// "show mask coverage" overlay is on.
+        coverage: Option<Vec<u8>>,
     },
     Region {
         width: usize,
@@ -182,7 +190,7 @@ impl WorkerState {
                     self.preview_geo = None;
                     self.full_geo = None;
                     let mut replies = vec![loaded];
-                    replies.extend(self.render_preview(&params, &tuning, true, clip));
+                    replies.extend(self.render_preview(&params, &tuning, true, clip, None));
                     replies
                 }
                 Err(e) => vec![Reply::Error(format!("{e:#}"))],
@@ -192,7 +200,8 @@ impl WorkerState {
                 tuning,
                 include_crop,
                 clip,
-            } => self.render_preview(&params, &tuning, include_crop, clip),
+                overlay,
+            } => self.render_preview(&params, &tuning, include_crop, clip, overlay),
             Cmd::RenderRegion {
                 params,
                 tuning,
@@ -213,8 +222,14 @@ impl WorkerState {
                 let Some(src) = self.geo_full(&params) else {
                     return vec![Reply::Error("no photo loaded to export".into())];
                 };
-                match crate::imgio::export::export(src, &params, &tuning, &dest, format, jpeg_quality)
-                {
+                match crate::imgio::export::export(
+                    src,
+                    &params,
+                    &tuning,
+                    &dest,
+                    format,
+                    jpeg_quality,
+                ) {
                     Ok(()) => vec![Reply::ExportDone(dest)],
                     Err(e) => vec![Reply::Error(format!("export failed: {e:#}"))],
                 }
@@ -236,6 +251,7 @@ impl WorkerState {
         tuning: &Tuning,
         include_crop: bool,
         clip: ClipFlags,
+        overlay: Option<usize>,
     ) -> Vec<Reply> {
         let Some(base) = &self.preview_base else {
             return Vec::new();
@@ -253,8 +269,16 @@ impl WorkerState {
             Some((_, Some(img))) => img,
             _ => base,
         };
-        let mut rgba =
-            pipeline::render_rgba(src, params, tuning, RenderCtx::full(src.width, src.height));
+        let ctx = RenderCtx::full(src.width, src.height);
+        let rgb = pipeline::render_rgb(src, params, tuning, ctx);
+        // The coverage wash travels as its own alpha map rather than being
+        // baked into the pixels, so the preview the UI samples for brush
+        // auto-masking and the color picker stays the real render.
+        let coverage = overlay
+            .and_then(|i| params.masks.get(i))
+            .map(|m| pipeline::mask_coverage(m, &rgb, src.width, src.height, ctx))
+            .map(|cov| cov.iter().map(|w| (w * 255.0 + 0.5) as u8).collect());
+        let mut rgba = pipeline::rgb_to_rgba(&rgb);
         let hist = histogram::compute(&rgba);
         histogram::mark_clipping(&mut rgba, clip.0, clip.1);
         let full = self.full.as_ref().expect("preview_base implies full");
@@ -264,6 +288,7 @@ impl WorkerState {
             rgba,
             full_size: geometry::oriented_dims(full.width, full.height, params, include_crop),
             histogram: hist,
+            coverage,
         }]
     }
 
@@ -299,9 +324,12 @@ impl WorkerState {
         // Never render beyond 1:1 of the source pixels or the size cap.
         let region_w_px = (norm_rect[2] * src.width as f32).max(1.0);
         let region_h_px = (norm_rect[3] * src.height as f32).max(1.0);
-        let mut scale = (tw as f32 / region_w_px).min(th as f32 / region_h_px).min(1.0);
+        let mut scale = (tw as f32 / region_w_px)
+            .min(th as f32 / region_h_px)
+            .min(1.0);
         if region_w_px * region_h_px * scale * scale > MAX_REGION_PIXELS as f32 {
-            scale *= (MAX_REGION_PIXELS as f32 / (region_w_px * region_h_px * scale * scale)).sqrt();
+            scale *=
+                (MAX_REGION_PIXELS as f32 / (region_w_px * region_h_px * scale * scale)).sqrt();
         }
         tw = ((region_w_px * scale) as usize).max(1);
         th = ((region_h_px * scale) as usize).max(1);

@@ -9,11 +9,22 @@ pub enum WelcomeAction {
     OpenRecent(PathBuf),
 }
 
-pub fn show(ui: &mut egui::Ui, recent: &[PathBuf]) -> Option<WelcomeAction> {
+pub fn show(
+    ui: &mut egui::Ui,
+    recent: &[PathBuf],
+    logo: Option<&egui::TextureHandle>,
+) -> Option<WelcomeAction> {
     let mut action = None;
     ui.vertical_centered(|ui| {
         let top_pad = (ui.available_height() * 0.24).max(20.0);
         ui.add_space(top_pad);
+        if let Some(logo) = logo {
+            ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                logo.id(),
+                egui::vec2(112.0, 112.0),
+            )));
+            ui.add_space(10.0);
+        }
         ui.label(
             egui::RichText::new("Photo Editor")
                 .size(30.0)

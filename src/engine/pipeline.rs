@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 use crate::engine::blur;
 use crate::engine::ops::{color, curve, detail, hsl, local, mask, sharpen, tone, vignette};
-use crate::engine::params::{EditParams, LocalAdjust, MaskKind};
+use crate::engine::params::{EditParams, LocalAdjust, Mask, MaskKind, MaskOp, RangeMask};
 use crate::engine::tuning::Tuning;
 
 /// A decoded photo held as linear RGB, 3 floats per pixel.
@@ -142,7 +142,13 @@ pub fn render_rgb(src: &SourceImage, p: &EditParams, t: &Tuning, ctx: RenderCtx)
     let any_range = hi != 0.0 || sh != 0.0 || wh != 0.0 || bl != 0.0;
     let has_levels = p.has_levels();
     let range_strength = t.tone_range_strength;
-    let lv = (p.lv_in_black, p.lv_in_white, p.lv_gamma, p.lv_out_black, p.lv_out_white);
+    let lv = (
+        p.lv_in_black,
+        p.lv_in_white,
+        p.lv_gamma,
+        p.lv_out_black,
+        p.lv_out_white,
+    );
     let curve_luts = curve::CurveLuts::build(&p.curve);
     let has_curve = !curve_luts.is_identity();
 
@@ -254,7 +260,7 @@ pub fn render_rgb(src: &SourceImage, p: &EditParams, t: &Tuning, ctx: RenderCtx)
     let vig = p.vignette / 100.0;
 
     // Prepare local adjustment masks (brush coverage + blur buffers).
-    let local = LocalPass::prepare(p, &buf, w, h, ctx);
+    let local = LocalPass::prepare(p, &buf, w, h, ctx, t);
 
     if any_hsl || vib != 0.0 || sat != 0.0 || dh != 0.0 || vig != 0.0 || local.active() {
         // Map buffer pixel coords to normalized full-image coords.
@@ -310,75 +316,148 @@ pub fn render_rgb(src: &SourceImage, p: &EditParams, t: &Tuning, ctx: RenderCtx)
     buf
 }
 
-/// One prepared local-adjustment mask: its geometry, adjustment, inversion,
-/// and (for brush masks) a rasterized coverage buffer.
-struct PreparedMask {
+/// One prepared shape inside a mask: its geometry, how it combines with the
+/// shapes above it, and (for brush shapes) a rasterized coverage buffer.
+struct PreparedComponent {
     kind: MaskKind,
-    adjust: LocalAdjust,
+    op: MaskOp,
     inverted: bool,
     brush: Option<Vec<f32>>,
 }
 
+impl PreparedComponent {
+    #[inline]
+    fn coverage(&self, i: usize, nx: f32, ny: f32) -> f32 {
+        let raw = match &self.brush {
+            Some(cov) => cov[i],
+            None => mask::weight_at(&self.kind, nx, ny),
+        };
+        mask::invert_if(raw, self.inverted)
+    }
+}
+
+/// One prepared local-adjustment mask: its composed shapes, its range mask,
+/// and the adjustment they gate.
+struct PreparedMask {
+    components: Vec<PreparedComponent>,
+    range: RangeMask,
+    range_active: bool,
+    adjust: LocalAdjust,
+    inverted: bool,
+}
+
+impl PreparedMask {
+    fn new(m: &Mask, buf: &[f32], w: usize, h: usize, ctx: RenderCtx) -> Self {
+        let components = m
+            .components
+            .iter()
+            .map(|c| PreparedComponent {
+                kind: c.kind.clone(),
+                op: c.op,
+                inverted: c.inverted,
+                brush: match &c.kind {
+                    MaskKind::Brush { dabs } => {
+                        Some(mask::rasterize_brush(dabs, w, h, ctx.norm_rect, buf))
+                    }
+                    _ => None,
+                },
+            })
+            .collect();
+        PreparedMask {
+            components,
+            range: m.range,
+            range_active: m.range.is_active(),
+            adjust: m.adjust,
+            inverted: m.inverted,
+        }
+    }
+
+    /// How strongly this mask selects the pixel at buffer index `i`, sitting
+    /// at normalized full-image coords (nx, ny).
+    #[inline]
+    fn weight(&self, px: [f32; 3], i: usize, nx: f32, ny: f32) -> f32 {
+        // Shapes compose into a base weight; a mask with no shapes covers the
+        // whole frame and relies on its range mask to narrow it down.
+        let base = if self.components.is_empty() {
+            1.0
+        } else {
+            mask::fold(
+                self.components
+                    .iter()
+                    .map(|c| (c.op, c.coverage(i, nx, ny))),
+            )
+        };
+        let mut weight = mask::invert_if(base, self.inverted);
+        if self.range_active && weight > 1e-4 {
+            weight *= mask::range_weight(px, &self.range);
+        }
+        weight
+    }
+}
+
 /// All local (masked) adjustments prepared for the position-aware pass:
-/// brush coverage buffers plus the blurred-luma buffers local clarity and
-/// sharpness need.
+/// brush coverage buffers, the blurred-luma buffers texture/clarity/sharpness
+/// need, and a denoised copy of the buffer for local noise reduction.
 struct LocalPass {
     masks: Vec<PreparedMask>,
-    blur_large: Vec<f32>,
-    blur_small: Vec<f32>,
-    have_large: bool,
-    have_small: bool,
+    blur_texture: Vec<f32>,
+    blur_clarity: Vec<f32>,
+    blur_sharpen: Vec<f32>,
+    denoised: Vec<f32>,
 }
 
 impl LocalPass {
-    fn prepare(p: &EditParams, buf: &[f32], w: usize, h: usize, ctx: RenderCtx) -> Self {
+    fn prepare(
+        p: &EditParams,
+        buf: &[f32],
+        w: usize,
+        h: usize,
+        ctx: RenderCtx,
+        t: &Tuning,
+    ) -> Self {
         let masks: Vec<PreparedMask> = p
             .active_masks()
-            .map(|m| {
-                let brush = match &m.kind {
-                    MaskKind::Brush { dabs } => {
-                        Some(mask::rasterize_brush(dabs, w, h, ctx.norm_rect))
-                    }
-                    _ => None,
-                };
-                PreparedMask {
-                    kind: m.kind.clone(),
-                    adjust: m.adjust,
-                    inverted: m.inverted,
-                    brush,
-                }
-            })
+            .map(|m| PreparedMask::new(m, buf, w, h, ctx))
             .collect();
 
-        let need_large = masks.iter().any(|m| local::needs_large_blur(&m.adjust));
-        let need_small = masks.iter().any(|m| local::needs_small_blur(&m.adjust));
-        let (blur_large, blur_small) = if need_large || need_small {
-            let lum: Vec<f32> = buf
-                .par_chunks(3)
+        let needs = |f: fn(&LocalAdjust) -> bool| masks.iter().any(|m| f(&m.adjust));
+        let (need_tx, need_cl) = (
+            needs(local::needs_texture_blur),
+            needs(local::needs_clarity_blur),
+        );
+        let need_sp = needs(local::needs_sharpen_blur);
+        let need_nr = needs(local::needs_denoise);
+
+        let dim = ctx.radius_dim;
+        let lum = (need_tx || need_cl || need_sp || need_nr).then(|| {
+            buf.par_chunks(3)
                 .map(|px| tone::luma(px[0], px[1], px[2]))
-                .collect();
-            let dim = ctx.radius_dim;
-            let bl = if need_large {
-                blur::gaussian_approx(&lum, w, h, ((dim * 0.010) as usize).max(2))
-            } else {
-                Vec::new()
-            };
-            let bs = if need_small {
-                blur::gaussian_approx(&lum, w, h, ((dim * 0.0015) as usize).max(1))
-            } else {
-                Vec::new()
-            };
-            (bl, bs)
-        } else {
-            (Vec::new(), Vec::new())
+                .collect::<Vec<f32>>()
+        });
+        let blur_at = |on: bool, radius: usize| match (&lum, on) {
+            (Some(l), true) => blur::gaussian_approx(l, w, h, radius),
+            _ => Vec::new(),
+        };
+        let blur_texture = blur_at(need_tx, ((dim * t.texture_radius) as usize).max(1));
+        let blur_clarity = blur_at(need_cl, ((dim * t.clarity_radius) as usize).max(2));
+        let blur_sharpen = blur_at(need_sp, ((dim * 0.0015) as usize).max(1));
+        // The denoised copy is computed at full strength; each mask's Noise
+        // slider then decides how far toward it that mask's pixels travel.
+        let denoised = match (&lum, need_nr) {
+            (Some(l), true) => {
+                let mut d = buf.to_vec();
+                sharpen::luminance_nr(&mut d, w, h, l, 1.0);
+                d
+            }
+            _ => Vec::new(),
         };
 
         LocalPass {
             masks,
-            have_large: need_large,
-            have_small: need_small,
-            blur_large,
-            blur_small,
+            blur_texture,
+            blur_clarity,
+            blur_sharpen,
+            denoised,
         }
     }
 
@@ -387,23 +466,40 @@ impl LocalPass {
         !self.masks.is_empty()
     }
 
+    /// The spatial inputs for the pixel at buffer index `i`, falling back to
+    /// the pixel's own values wherever a buffer wasn't needed.
+    #[inline]
+    fn neighborhood(&self, px: [f32; 3], l: f32, i: usize) -> local::Neighborhood {
+        let at = |b: &Vec<f32>| if b.is_empty() { l } else { b[i] };
+        local::Neighborhood {
+            blur_texture: at(&self.blur_texture),
+            blur_clarity: at(&self.blur_clarity),
+            blur_sharpen: at(&self.blur_sharpen),
+            denoised: if self.denoised.is_empty() {
+                px
+            } else {
+                [
+                    self.denoised[i * 3],
+                    self.denoised[i * 3 + 1],
+                    self.denoised[i * 3 + 2],
+                ]
+            },
+        }
+    }
+
     /// Apply every active mask to one pixel at buffer index `i` / normalized
     /// full-image coords (nx, ny).
     #[inline]
     fn apply(&self, px: &mut [f32], i: usize, nx: f32, ny: f32) {
         for m in &self.masks {
-            let raw = match &m.brush {
-                Some(cov) => cov[i],
-                None => mask::weight_at(&m.kind, nx, ny),
-            };
-            let weight = if m.inverted { 1.0 - raw } else { raw };
+            let weight = m.weight([px[0], px[1], px[2]], i, nx, ny);
             if weight <= 1e-4 {
                 continue;
             }
+            let pixel = [px[0], px[1], px[2]];
             let l = tone::luma(px[0], px[1], px[2]);
-            let blg = if self.have_large { self.blur_large[i] } else { l };
-            let bs = if self.have_small { self.blur_small[i] } else { l };
-            let target = local::target([px[0], px[1], px[2]], l, blg, bs, &m.adjust);
+            let n = self.neighborhood(pixel, l, i);
+            let target = local::target(pixel, &n, &m.adjust);
             px[0] += (target[0] - px[0]) * weight;
             px[1] += (target[1] - px[1]) * weight;
             px[2] += (target[2] - px[2]) * weight;
@@ -440,8 +536,12 @@ pub fn sample_patch(src: &SourceImage, norm_point: [f32; 2]) -> [f32; 3] {
 
 /// Render straight to RGBA bytes for display in egui.
 pub fn render_rgba(src: &SourceImage, p: &EditParams, t: &Tuning, ctx: RenderCtx) -> Vec<u8> {
-    let rgb = render_rgb(src, p, t, ctx);
-    let mut out = vec![255u8; src.width * src.height * 4];
+    rgb_to_rgba(&render_rgb(src, p, t, ctx))
+}
+
+/// Pack a rendered gamma-space buffer into opaque RGBA bytes.
+pub fn rgb_to_rgba(rgb: &[f32]) -> Vec<u8> {
+    let mut out = vec![255u8; rgb.len() / 3 * 4];
     out.par_chunks_mut(4)
         .zip(rgb.par_chunks(3))
         .for_each(|(d, s)| {
@@ -449,6 +549,38 @@ pub fn render_rgba(src: &SourceImage, p: &EditParams, t: &Tuning, ctx: RenderCtx
             d[1] = (s[1] * 255.0 + 0.5) as u8;
             d[2] = (s[2] * 255.0 + 0.5) as u8;
         });
+    out
+}
+
+/// Per-pixel coverage of one mask over a rendered (gamma-space) buffer, using
+/// the same shape composition, inversion and range logic as the render — this
+/// is what the UI washes over the photo so you can see what a mask selects.
+///
+/// Coverage is measured against the *finished* pixels, so a range mask's wash
+/// can differ very slightly from the selection the render itself used, which
+/// tests each pixel before that mask's own adjustments land on it.
+pub fn mask_coverage(m: &Mask, buf: &[f32], w: usize, h: usize, ctx: RenderCtx) -> Vec<f32> {
+    // A mask with neither a shape nor a range selects nothing in the render,
+    // so it must not wash the whole frame here either.
+    if !m.has_selection() {
+        return vec![0.0; w * h];
+    }
+    let prepared = PreparedMask::new(m, buf, w, h, ctx);
+    let nx0 = ctx.norm_rect[0];
+    let ny0 = ctx.norm_rect[1];
+    let nxs = ctx.norm_rect[2] / w as f32;
+    let nys = ctx.norm_rect[3] / h as f32;
+    let mut out = vec![0.0f32; w * h];
+    out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        let ny = ny0 + (y as f32 + 0.5) * nys;
+        for (x, slot) in row.iter_mut().enumerate() {
+            let i = y * w + x;
+            let px = [buf[i * 3], buf[i * 3 + 1], buf[i * 3 + 2]];
+            *slot = prepared
+                .weight(px, i, nx0 + (x as f32 + 0.5) * nxs, ny)
+                .clamp(0.0, 1.0);
+        }
+    });
     out
 }
 
@@ -471,7 +603,12 @@ mod tests {
     }
 
     fn render_full(src: &SourceImage, p: &EditParams) -> Vec<f32> {
-        render_rgb(src, p, &Tuning::default(), RenderCtx::full(src.width, src.height))
+        render_rgb(
+            src,
+            p,
+            &Tuning::default(),
+            RenderCtx::full(src.width, src.height),
+        )
     }
 
     #[test]
@@ -534,7 +671,11 @@ mod tests {
         let region = src.sample_region([0.5, 0.0, 0.5, 1.0], 4, 8);
         assert_eq!((region.width, region.height), (4, 8));
         // First column of the region should be around x = 4.
-        assert!((region.data[0] - 4.0).abs() < 0.51, "got {}", region.data[0]);
+        assert!(
+            (region.data[0] - 4.0).abs() < 0.51,
+            "got {}",
+            region.data[0]
+        );
         // Last column around x = 7.
         let last = region.data[(3) * 3];
         assert!((last - 7.0).abs() < 0.51, "got {last}");
@@ -572,34 +713,334 @@ mod tests {
         }
     }
 
+    /// A gray n×n image plus one mask, rendered full-frame.
+    fn render_with_mask(n: usize, gray: f32, mask: crate::engine::params::Mask) -> Vec<f32> {
+        let src = SourceImage {
+            width: n,
+            height: n,
+            data: vec![gray; n * n * 3],
+        };
+        let mut p = EditParams::default();
+        p.masks.push(mask);
+        render_rgb(&src, &p, &Tuning::default(), RenderCtx::full(n, n))
+    }
+
+    /// A radial mask over the middle of the frame, brightening what it covers.
+    fn brightening_radial() -> crate::engine::params::Mask {
+        use crate::engine::params::{LocalAdjust, Mask, MaskComponent, MaskKind, MaskOp};
+        let mut adj = LocalAdjust::default();
+        adj.exposure = 80.0;
+        Mask {
+            name: "m".into(),
+            components: vec![MaskComponent::new(
+                MaskKind::Radial {
+                    center: [0.5, 0.5],
+                    radius: [0.35, 0.35],
+                    feather: 0.2,
+                },
+                MaskOp::Add,
+            )],
+            adjust: adj,
+            ..Mask::default()
+        }
+    }
+
     #[test]
     fn local_mask_only_affects_covered_region() {
-        use crate::engine::params::{LocalAdjust, Mask, MaskKind};
-        // Flat gray image; a radial mask brightening the center.
         let n = 32;
+        let out = render_with_mask(n, 0.3, brightening_radial());
+        let center = out[((n / 2) * n + n / 2) * 3];
+        let corner = out[0];
+        assert!(
+            center > corner + 0.1,
+            "mask center {center} vs corner {corner}"
+        );
+    }
+
+    #[test]
+    fn subtracting_a_component_cuts_a_hole_in_the_mask() {
+        use crate::engine::params::{MaskComponent, MaskKind, MaskOp};
+        let n = 32;
+        let mut mask = brightening_radial();
+        // Punch a smaller radial out of the middle of the first one.
+        mask.components.push(MaskComponent::new(
+            MaskKind::Radial {
+                center: [0.5, 0.5],
+                radius: [0.12, 0.12],
+                feather: 0.1,
+            },
+            MaskOp::Subtract,
+        ));
+        let out = render_with_mask(n, 0.3, mask);
+        let center = out[((n / 2) * n + n / 2) * 3];
+        let mid_ring = out[((n / 2) * n + n / 2 + 8) * 3]; // inside the big radial
+        let corner = out[0];
+        // The hole is back to the untouched value; the ring around it is lifted.
+        assert!(
+            (center - corner).abs() < 1e-3,
+            "hole {center} vs corner {corner}"
+        );
+        assert!(
+            mid_ring > corner + 0.1,
+            "ring {mid_ring} vs corner {corner}"
+        );
+    }
+
+    #[test]
+    fn intersecting_components_keep_only_the_overlap() {
+        use crate::engine::params::{MaskComponent, MaskKind, MaskOp};
+        let n = 32;
+        let mut mask = brightening_radial();
+        // Keep only the left half of the radial.
+        mask.components.push(MaskComponent::new(
+            MaskKind::Linear {
+                p0: [0.55, 0.5],
+                p1: [0.45, 0.5],
+            },
+            MaskOp::Intersect,
+        ));
+        let out = render_with_mask(n, 0.3, mask);
+        let row = n / 2;
+        let left = out[(row * n + n / 2 - 6) * 3];
+        let right = out[(row * n + n / 2 + 6) * 3];
+        let corner = out[0];
+        assert!(left > corner + 0.1, "left {left} vs corner {corner}");
+        assert!(
+            (right - corner).abs() < 1e-3,
+            "right {right} vs corner {corner}"
+        );
+    }
+
+    #[test]
+    fn a_range_mask_narrows_a_shape_by_pixel_color() {
+        use crate::engine::params::{LocalAdjust, Mask};
+        // Left half dark, right half bright, no shapes — just a luminance
+        // range that admits only the bright half.
+        let n = 32;
+        let mut data = vec![0.0f32; n * n * 3];
+        for y in 0..n {
+            for x in 0..n {
+                let v = if x < n / 2 { 0.05 } else { 0.6 };
+                let i = (y * n + x) * 3;
+                data[i] = v;
+                data[i + 1] = v;
+                data[i + 2] = v;
+            }
+        }
+        let src = SourceImage {
+            width: n,
+            height: n,
+            data,
+        };
+        let mut adj = LocalAdjust::default();
+        adj.exposure = 60.0;
+        let mut mask = Mask {
+            name: "bright".into(),
+            components: Vec::new(),
+            adjust: adj,
+            ..Mask::default()
+        };
+        mask.range.lum_enabled = true;
+        mask.range.lum_lo = 0.6;
+        mask.range.lum_hi = 1.0;
+        mask.range.lum_feather = 0.1;
+
+        let mut p = EditParams::default();
+        p.masks.push(mask);
+        let t = Tuning::default();
+        let out = render_rgb(&src, &p, &t, RenderCtx::full(n, n));
+        let plain = render_rgb(&src, &EditParams::default(), &t, RenderCtx::full(n, n));
+        let row = n / 2;
+        let dark = (row * n + 4) * 3;
+        let bright = (row * n + n - 4) * 3;
+        assert!(
+            (out[dark] - plain[dark]).abs() < 1e-3,
+            "dark half was touched"
+        );
+        assert!(
+            out[bright] > plain[bright] + 0.05,
+            "bright half was not lifted"
+        );
+    }
+
+    #[test]
+    fn local_mask_region_render_matches_the_full_render() {
+        // The same guarantee the vignette has: a composed mask with a range
+        // must resolve identically whether the whole frame is rendered or
+        // just a zoomed-in quadrant of it.
+        use crate::engine::params::{MaskComponent, MaskKind, MaskOp};
+        let n = 32;
+        let mut mask = brightening_radial();
+        mask.components.push(MaskComponent::new(
+            MaskKind::Linear {
+                p0: [0.2, 0.5],
+                p1: [0.8, 0.5],
+            },
+            MaskOp::Intersect,
+        ));
+        mask.range.lum_enabled = true;
+        mask.range.lum_lo = 0.1;
+        mask.range.lum_hi = 1.0;
+
         let src = SourceImage {
             width: n,
             height: n,
             data: vec![0.3; n * n * 3],
         };
         let mut p = EditParams::default();
-        let mut adj = LocalAdjust::default();
-        adj.exposure = 80.0;
-        p.masks.push(Mask {
-            name: "m".into(),
-            kind: MaskKind::Radial {
+        p.masks.push(mask);
+        let t = Tuning::default();
+        let full = render_rgb(&src, &p, &t, RenderCtx::full(n, n));
+
+        let quad = src.sample_region([0.5, 0.5, 0.5, 0.5], n / 2, n / 2);
+        let ctx = RenderCtx {
+            norm_rect: [0.5, 0.5, 0.5, 0.5],
+            radius_dim: n as f32,
+        };
+        let region = render_rgb(&quad, &p, &t, ctx);
+        for y in 0..n / 2 {
+            for x in 0..n / 2 {
+                let f = full[((y + n / 2) * n + (x + n / 2)) * 3];
+                let r = region[(y * (n / 2) + x) * 3];
+                assert!((f - r).abs() < 1e-3, "mismatch at {x},{y}: {f} vs {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn mask_coverage_reports_what_the_render_adjusts() {
+        // The overlay must agree with the pixels: wherever coverage is high
+        // the render moved, and wherever it is zero the render did not.
+        let n = 32;
+        let mask = brightening_radial();
+        let src = SourceImage {
+            width: n,
+            height: n,
+            data: vec![0.3; n * n * 3],
+        };
+        let t = Tuning::default();
+        let ctx = RenderCtx::full(n, n);
+        let plain = render_rgb(&src, &EditParams::default(), &t, ctx);
+
+        let mut p = EditParams::default();
+        p.masks.push(mask.clone());
+        let edited = render_rgb(&src, &p, &t, ctx);
+        let cov = mask_coverage(&mask, &edited, n, n, ctx);
+
+        assert_eq!(cov.len(), n * n);
+        assert!(cov[(n / 2) * n + n / 2] > 0.99, "center should be covered");
+        assert_eq!(cov[0], 0.0, "corner should be outside the radial");
+        for i in 0..n * n {
+            let moved = (edited[i * 3] - plain[i * 3]).abs() > 1e-4;
+            assert_eq!(
+                moved,
+                cov[i] > 1e-4,
+                "coverage {} disagrees with the render at pixel {i}",
+                cov[i]
+            );
+        }
+    }
+
+    #[test]
+    fn mask_coverage_of_an_empty_mask_is_empty() {
+        use crate::engine::params::Mask;
+        let n = 8;
+        let buf = vec![0.5; n * n * 3];
+        let ctx = RenderCtx::full(n, n);
+        let mut m = Mask::default();
+        m.components.clear();
+        // No shapes and no range: selects nothing, so washes nothing.
+        assert!(mask_coverage(&m, &buf, n, n, ctx).iter().all(|&w| w == 0.0));
+        // Add a range and the whole frame becomes fair game again.
+        m.range.lum_enabled = true;
+        assert!(mask_coverage(&m, &buf, n, n, ctx).iter().any(|&w| w > 0.5));
+    }
+
+    #[test]
+    fn mask_coverage_sees_inversion_and_subtraction() {
+        use crate::engine::params::{MaskComponent, MaskKind, MaskOp};
+        let n = 16;
+        let buf = vec![0.5; n * n * 3];
+        let ctx = RenderCtx::full(n, n);
+
+        let mut mask = brightening_radial();
+        let inside = (n / 2) * n + n / 2;
+        assert!(mask_coverage(&mask, &buf, n, n, ctx)[inside] > 0.99);
+
+        mask.inverted = true;
+        assert!(mask_coverage(&mask, &buf, n, n, ctx)[inside] < 0.01);
+        assert!(mask_coverage(&mask, &buf, n, n, ctx)[0] > 0.99);
+
+        // Subtracting a shape that covers everything empties the mask.
+        mask.inverted = false;
+        mask.components.push(MaskComponent::new(
+            MaskKind::Radial {
                 center: [0.5, 0.5],
-                radius: [0.2, 0.2],
-                feather: 0.4,
+                radius: [5.0, 5.0],
+                feather: 0.0,
             },
+            MaskOp::Subtract,
+        ));
+        assert!(mask_coverage(&mask, &buf, n, n, ctx)
+            .iter()
+            .all(|&w| w < 1e-4));
+    }
+
+    #[test]
+    fn auto_masked_brush_matches_between_full_and_region_renders() {
+        // Auto-mask references are captured at paint time, so a stroke must
+        // resolve the same way even when the dab's center lies outside the
+        // region being rendered.
+        use crate::engine::params::{Dab, LocalAdjust, Mask, MaskComponent, MaskKind, MaskOp};
+        let n = 32;
+        let mut data = vec![0.0f32; n * n * 3];
+        for y in 0..n {
+            for x in 0..n {
+                let v = if y < n / 2 { 0.2 } else { 0.7 };
+                let i = (y * n + x) * 3;
+                data[i] = v;
+                data[i + 1] = v;
+                data[i + 2] = v;
+            }
+        }
+        let src = SourceImage {
+            width: n,
+            height: n,
+            data,
+        };
+        let mut adj = LocalAdjust::default();
+        adj.exposure = 70.0;
+        // Dab centered in the top-left quadrant, spilling into all four.
+        let dabs = vec![Dab {
+            p: [0.35, 0.35],
+            radius: 0.5,
+            hardness: 0.9,
+            erase: false,
+            auto: Some([0.48, 0.48, 0.48]), // gamma-space value of linear 0.2
+        }];
+        let mut p = EditParams::default();
+        p.masks.push(Mask {
+            name: "brush".into(),
+            components: vec![MaskComponent::new(MaskKind::Brush { dabs }, MaskOp::Add)],
             adjust: adj,
-            enabled: true,
-            inverted: false,
+            ..Mask::default()
         });
-        let out = render_rgb(&src, &p, &Tuning::default(), RenderCtx::full(n, n));
-        let center = out[((n / 2) * n + n / 2) * 3];
-        let corner = out[0];
-        assert!(center > corner + 0.1, "mask center {center} vs corner {corner}");
+        let t = Tuning::default();
+        let full = render_rgb(&src, &p, &t, RenderCtx::full(n, n));
+
+        let quad = src.sample_region([0.5, 0.0, 0.5, 0.5], n / 2, n / 2);
+        let ctx = RenderCtx {
+            norm_rect: [0.5, 0.0, 0.5, 0.5],
+            radius_dim: n as f32,
+        };
+        let region = render_rgb(&quad, &p, &t, ctx);
+        for y in 0..n / 2 {
+            for x in 0..n / 2 {
+                let f = full[(y * n + (x + n / 2)) * 3];
+                let r = region[(y * (n / 2) + x) * 3];
+                assert!((f - r).abs() < 1e-3, "mismatch at {x},{y}: {f} vs {r}");
+            }
+        }
     }
 
     #[test]

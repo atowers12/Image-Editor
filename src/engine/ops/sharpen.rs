@@ -63,8 +63,8 @@ pub fn luminance_nr(buf: &mut [f32], w: usize, h: usize, lum: &[f32], amount: f3
                     let xx = (x + dx).clamp(0, w as isize - 1);
                     let s = lum[(yy * w as isize + xx) as usize];
                     let dr = s - center;
-                    let wgt = spatial[(dy + R) as usize][(dx + R) as usize]
-                        * (-dr * dr * inv_2s2).exp();
+                    let wgt =
+                        spatial[(dy + R) as usize][(dx + R) as usize] * (-dr * dr * inv_2s2).exp();
                     acc += s * wgt;
                     wsum += wgt;
                 }
@@ -99,7 +99,10 @@ pub fn color_nr(buf: &mut [f32], w: usize, h: usize, amount: f32, dim: f32) {
         vec![0.0f32; w * h],
     );
     buf.par_chunks(3)
-        .zip(cr.par_iter_mut().zip(cg.par_iter_mut().zip(cb.par_iter_mut())))
+        .zip(
+            cr.par_iter_mut()
+                .zip(cg.par_iter_mut().zip(cb.par_iter_mut())),
+        )
         .for_each(|(px, (r, (g, b)))| {
             *r = px[0];
             *g = px[1];

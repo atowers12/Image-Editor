@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::engine::histogram::Histogram;
+use crate::engine::ops;
 use crate::engine::params::{CurveChannel, EditParams, Flag};
 use crate::engine::tuning::Tuning;
 use crate::engine::worker::{self, Cmd, Reply, Worker};
@@ -25,6 +26,8 @@ use crate::ui::{
 const SIDECAR_DEBOUNCE: Duration = Duration::from_millis(700);
 /// How long transient status/error messages stay visible.
 const TOAST_TTL: Duration = Duration::from_secs(5);
+/// How opaque the mask-coverage wash is where a mask selects fully.
+const COVERAGE_ALPHA: u8 = 130;
 /// Cap on the undo history depth per photo.
 const MAX_HISTORY: usize = 100;
 
@@ -40,6 +43,17 @@ enum Mode {
     Adjust,
     Crop,
     Mask,
+}
+
+/// What the next eyedropper click is for. Both pickers arm the same crosshair
+/// over the preview; only where the sampled color lands differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    None,
+    /// Set global temp/tint from a pixel that should be neutral gray.
+    WhiteBalance,
+    /// Aim the selected mask's color range at a pixel's hue.
+    MaskColor,
 }
 
 pub struct App {
@@ -66,6 +80,12 @@ pub struct App {
     committed: EditParams,
 
     preview_tex: Option<egui::TextureHandle>,
+    /// The preview's pixels as well as its texture, so the brush can read the
+    /// color it is painting over for auto-masking.
+    preview_rgba: Option<(usize, usize, Vec<u8>)>,
+    /// Red wash showing what the mask being edited selects, when enabled.
+    coverage_tex: Option<egui::TextureHandle>,
+    logo_tex: Option<egui::TextureHandle>,
     thumb_tex: HashMap<PathBuf, egui::TextureHandle>,
     full_size: Option<(usize, usize)>,
     oriented_dims: Option<(usize, usize)>,
@@ -83,12 +103,15 @@ pub struct App {
     batch: Option<BatchState>,
     mode: Mode,
     before_view: bool,
-    eyedropper: bool,
+    pick: Pick,
     aspect: AspectLock,
     active_band: usize,
     curve_channel: CurveChannel,
     selected_mask: Option<usize>,
+    /// Which shape inside the selected mask the preview edits.
+    selected_component: usize,
     brush: BrushSettings,
+    show_mask_overlay: bool,
 
     export_dialog: ExportDialog,
     settings_open: bool,
@@ -102,6 +125,14 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let logo_tex = crate::branding::icon_data(256).map(|icon| {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            );
+            cc.egui_ctx
+                .load_texture("app-logo", image, egui::TextureOptions::LINEAR)
+        });
         Self {
             worker: worker::spawn(cc.egui_ctx.clone()),
             thumbs: thumbs::spawn(cc.egui_ctx.clone()),
@@ -120,6 +151,9 @@ impl App {
             redo: Vec::new(),
             committed: EditParams::default(),
             preview_tex: None,
+            preview_rgba: None,
+            coverage_tex: None,
+            logo_tex,
             thumb_tex: HashMap::new(),
             full_size: None,
             oriented_dims: None,
@@ -135,12 +169,14 @@ impl App {
             batch: None,
             mode: Mode::Adjust,
             before_view: false,
-            eyedropper: false,
+            pick: Pick::None,
             aspect: AspectLock::Free,
             active_band: 0,
             curve_channel: CurveChannel::Master,
             selected_mask: None,
+            selected_component: 0,
             brush: BrushSettings::default(),
+            show_mask_overlay: false,
             export_dialog: ExportDialog::default(),
             settings_open: false,
             preset_list: presets::list(),
@@ -169,11 +205,17 @@ impl App {
 
     fn request_render(&mut self) {
         self.invalidate_region();
+        // The coverage wash is only meaningful while a mask is being built,
+        // and only for the mask being worked on.
+        let overlay = (self.mode == Mode::Mask && self.show_mask_overlay && !self.before_view)
+            .then_some(self.selected_mask)
+            .flatten();
         let _ = self.worker.tx.send(Cmd::Render {
             params: self.effective_params(),
             tuning: self.tuning,
             include_crop: self.mode != Mode::Crop,
             clip: self.clip_flags(),
+            overlay,
         });
     }
 
@@ -194,7 +236,7 @@ impl App {
                 Reply::Neutral { temp, tint } => {
                     self.params.temp = temp;
                     self.params.tint = tint;
-                    self.eyedropper = false;
+                    self.pick = Pick::None;
                     self.before_view = false;
                     self.params_edited();
                 }
@@ -204,7 +246,9 @@ impl App {
                     rgba,
                     full_size,
                     histogram,
+                    coverage,
                 } => {
+                    self.set_coverage_tex(ctx, width, height, coverage);
                     let img = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                     match &mut self.preview_tex {
                         Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
@@ -213,6 +257,7 @@ impl App {
                                 Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR))
                         }
                     }
+                    self.preview_rgba = Some((width, height, rgba));
                     self.oriented_dims = Some(full_size);
                     self.hist = Some(histogram);
                     self.loading = false;
@@ -315,6 +360,64 @@ impl App {
         }
     }
 
+    /// Turn a mask's coverage map into a translucent red wash the preview can
+    /// draw over the photo, so you can see exactly what the mask selects.
+    fn set_coverage_tex(
+        &mut self,
+        ctx: &egui::Context,
+        width: usize,
+        height: usize,
+        coverage: Option<Vec<u8>>,
+    ) {
+        let Some(cov) = coverage else {
+            self.coverage_tex = None;
+            return;
+        };
+        let mut rgba = vec![0u8; width * height * 4];
+        for (px, &c) in rgba.chunks_mut(4).zip(cov.iter()) {
+            px[0] = 255;
+            px[1] = 60;
+            px[2] = 60;
+            px[3] = (c as u32 * COVERAGE_ALPHA as u32 / 255) as u8;
+        }
+        let img = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
+        match &mut self.coverage_tex {
+            Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
+            None => {
+                self.coverage_tex =
+                    Some(ctx.load_texture("coverage", img, egui::TextureOptions::LINEAR))
+            }
+        }
+    }
+
+    /// Point the selected mask's color range at the pixel the eyedropper hit,
+    /// read straight out of the preview the user clicked on.
+    fn aim_mask_color(&mut self, point: [f32; 2]) {
+        self.pick = Pick::None;
+        let Some(idx) = self.selected_mask.filter(|&i| i < self.params.masks.len()) else {
+            return;
+        };
+        let Some((w, h, rgba)) = &self.preview_rgba else {
+            return;
+        };
+        if *w == 0 || *h == 0 {
+            return;
+        }
+        let x = ((point[0] * *w as f32) as usize).min(w - 1);
+        let y = ((point[1] * *h as f32) as usize).min(h - 1);
+        let i = (y * w + x) * 4;
+        let Some(px) = rgba.get(i..i + 3) else {
+            return;
+        };
+        let (hue, sat, _) = ops::color::rgb_to_hsl(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+        masks::aim_color_range(&mut self.params.masks[idx].range, hue, sat);
+        self.params_edited();
+    }
+
     fn params_edited(&mut self) {
         self.sidecar_dirty = true;
         self.last_edit = Instant::now();
@@ -377,8 +480,9 @@ impl App {
         self.loading = true;
         self.mode = Mode::Adjust;
         self.before_view = false;
-        self.eyedropper = false;
+        self.pick = Pick::None;
         self.selected_mask = None;
+        self.selected_component = 0;
         self.aspect = AspectLock::Free;
         self.preview_state = preview::PreviewState::default();
         self.region_tex = None;
@@ -483,7 +587,8 @@ impl App {
         let (undo, redo, digits, pick, reject) = ctx.input(|i| {
             let undo = i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
             let redo = i.modifiers.command
-                && (i.key_pressed(egui::Key::Y) || (i.modifiers.shift && i.key_pressed(egui::Key::Z)));
+                && (i.key_pressed(egui::Key::Y)
+                    || (i.modifiers.shift && i.key_pressed(egui::Key::Z)));
             let mut digit = None;
             for (k, n) in [
                 (egui::Key::Num0, 0u8),
@@ -519,11 +624,19 @@ impl App {
             self.params_edited();
         }
         if pick {
-            self.params.flag = if self.params.flag == Flag::Pick { Flag::None } else { Flag::Pick };
+            self.params.flag = if self.params.flag == Flag::Pick {
+                Flag::None
+            } else {
+                Flag::Pick
+            };
             self.params_edited();
         }
         if reject {
-            self.params.flag = if self.params.flag == Flag::Reject { Flag::None } else { Flag::Reject };
+            self.params.flag = if self.params.flag == Flag::Reject {
+                Flag::None
+            } else {
+                Flag::Reject
+            };
             self.params_edited();
         }
     }
@@ -617,20 +730,33 @@ impl App {
                 }
             }
             if ui
-                .add_enabled(can_paste && self.files.len() > 1, egui::Button::new("📋 All"))
+                .add_enabled(
+                    can_paste && self.files.len() > 1,
+                    egui::Button::new("📋 All"),
+                )
                 .clicked()
             {
                 self.confirm_paste_all = true;
             }
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("⚙").on_hover_text("Processing settings").clicked() {
+                if ui
+                    .button("⚙")
+                    .on_hover_text("Processing settings")
+                    .clicked()
+                {
                     self.settings_open = !self.settings_open;
                 }
                 if let Some(b) = &self.batch {
                     let frac = (b.done as f32 + 0.5) / b.job.total.max(1) as f32;
-                    if ui.button("✖").on_hover_text("Cancel batch export").clicked() {
-                        b.job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    if ui
+                        .button("✖")
+                        .on_hover_text("Cancel batch export")
+                        .clicked()
+                    {
+                        b.job
+                            .cancel
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                     ui.add(
                         egui::ProgressBar::new(frac)
@@ -666,9 +792,10 @@ impl App {
         {
             self.mode = if active { Mode::Adjust } else { mode };
             self.before_view = false;
-            self.eyedropper = false;
+            self.pick = Pick::None;
             if self.mode == Mode::Mask && self.selected_mask.is_none() {
-                self.selected_mask = self.params.masks.iter().position(|_| true);
+                self.selected_mask = (!self.params.masks.is_empty()).then_some(0);
+                self.selected_component = 0;
             }
             self.request_render();
         }
@@ -684,7 +811,10 @@ impl App {
             let mut to_delete = None;
             for name in &self.preset_list {
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(has_photo, egui::Button::new(name).frame(false)).clicked() {
+                    if ui
+                        .add_enabled(has_photo, egui::Button::new(name).frame(false))
+                        .clicked()
+                    {
                         to_apply = Some(name.clone());
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -702,7 +832,10 @@ impl App {
                         .desired_width(120.0),
                 );
                 if ui
-                    .add_enabled(has_photo && !self.new_preset_name.trim().is_empty(), egui::Button::new("Save"))
+                    .add_enabled(
+                        has_photo && !self.new_preset_name.trim().is_empty(),
+                        egui::Button::new("Save"),
+                    )
                     .clicked()
                 {
                     let name = self.new_preset_name.trim().to_string();
@@ -879,11 +1012,23 @@ impl App {
                 ui,
                 &mut self.params,
                 &mut self.selected_mask,
+                &mut self.selected_component,
                 &mut self.brush,
+                &mut self.show_mask_overlay,
+                self.pick == Pick::MaskColor,
             ) {
                 masks::MaskAction::Changed => self.params_edited(),
+                masks::MaskAction::ViewChanged => self.request_render(),
+                masks::MaskAction::PickColor => {
+                    self.pick = if self.pick == Pick::MaskColor {
+                        Pick::None
+                    } else {
+                        Pick::MaskColor
+                    };
+                }
                 masks::MaskAction::Done => {
                     self.mode = Mode::Adjust;
+                    self.pick = Pick::None;
                     self.request_render();
                 }
                 masks::MaskAction::None => {}
@@ -894,10 +1039,14 @@ impl App {
                     &mut self.params,
                     &mut self.active_band,
                     &mut self.curve_channel,
-                    self.eyedropper,
+                    self.pick == Pick::WhiteBalance,
                 );
                 if out.eyedropper_toggled {
-                    self.eyedropper = !self.eyedropper;
+                    self.pick = if self.pick == Pick::WhiteBalance {
+                        Pick::None
+                    } else {
+                        Pick::WhiteBalance
+                    };
                 }
                 if out.changed {
                     self.before_view = false;
@@ -929,15 +1078,32 @@ impl App {
             None
         };
         let mask_editor = if self.mode == Mode::Mask {
+            let brush = self.brush;
+            let selected_component = self.selected_component;
+            let pixels = self
+                .preview_rgba
+                .as_ref()
+                .map(|(w, h, rgba)| preview::PreviewPixels {
+                    width: *w,
+                    height: *h,
+                    rgba,
+                });
             self.selected_mask
                 .filter(|&i| i < self.params.masks.len())
                 .map(|i| preview::MaskEditor {
-                    kind: &mut self.params.masks[i].kind,
-                    brush: self.brush,
+                    components: &mut self.params.masks[i].components,
+                    selected: selected_component,
+                    brush,
+                    preview: pixels,
                 })
         } else {
             None
         };
+
+        // The wash only makes sense over the mask it was rendered for.
+        let coverage = (self.mode == Mode::Mask)
+            .then_some(self.coverage_tex.as_ref())
+            .flatten();
 
         let out = preview::show(
             ui,
@@ -948,7 +1114,8 @@ impl App {
             region,
             crop_overlay,
             mask_editor,
-            self.eyedropper,
+            coverage,
+            self.pick != Pick::None,
         );
 
         if out.crop_changed {
@@ -958,10 +1125,20 @@ impl App {
             self.params_edited();
         }
         if let Some(point) = out.eyedrop_point {
-            let _ = self.worker.tx.send(Cmd::SampleNeutral {
-                params: self.params.clone(),
-                norm_point: point,
-            });
+            match self.pick {
+                // White balance solves against the undeveloped source, so it
+                // has to go through the worker, which owns those pixels.
+                Pick::WhiteBalance => {
+                    let _ = self.worker.tx.send(Cmd::SampleNeutral {
+                        params: self.params.clone(),
+                        norm_point: point,
+                    });
+                }
+                // A range mask matches the developed pixels, which are
+                // exactly what the preview is already showing.
+                Pick::MaskColor => self.aim_mask_color(point),
+                Pick::None => {}
+            }
         }
         if let Some(req) = out.region_request {
             let is_new = self
@@ -1002,7 +1179,7 @@ impl eframe::App for App {
 
         if self.files.is_empty() {
             egui::CentralPanel::default().show(ctx, |ui| {
-                match welcome::show(ui, &self.recent) {
+                match welcome::show(ui, &self.recent, self.logo_tex.as_ref()) {
                     Some(welcome::WelcomeAction::OpenFolder) => self.open_folder_dialog(),
                     Some(welcome::WelcomeAction::OpenFile) => self.open_file_dialog(),
                     Some(welcome::WelcomeAction::OpenRecent(dir)) => self.set_folder(dir, None),
@@ -1059,7 +1236,9 @@ impl eframe::App for App {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         if let Some(b) = &self.batch {
-            b.job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            b.job
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.commit_and_save();
     }

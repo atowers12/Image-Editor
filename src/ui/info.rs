@@ -18,11 +18,18 @@ pub fn ratings(ui: &mut egui::Ui, params: &mut EditParams) -> bool {
                 ui.visuals().weak_text_color()
             };
             if ui
-                .add(egui::Button::new(egui::RichText::new(txt).size(18.0).color(color)).frame(false))
+                .add(
+                    egui::Button::new(egui::RichText::new(txt).size(18.0).color(color))
+                        .frame(false),
+                )
                 .clicked()
             {
                 // Clicking the current rating clears it.
-                params.rating = if params.rating == star { star - 1 } else { star };
+                params.rating = if params.rating == star {
+                    star - 1
+                } else {
+                    star
+                };
                 changed = true;
             }
         }
@@ -30,10 +37,7 @@ pub fn ratings(ui: &mut egui::Ui, params: &mut EditParams) -> bool {
         // Flags.
         let pick = params.flag == Flag::Pick;
         let reject = params.flag == Flag::Reject;
-        if ui
-            .add(egui::SelectableLabel::new(pick, "⚑ Pick"))
-            .clicked()
-        {
+        if ui.add(egui::SelectableLabel::new(pick, "⚑ Pick")).clicked() {
             params.flag = if pick { Flag::None } else { Flag::Pick };
             changed = true;
         }

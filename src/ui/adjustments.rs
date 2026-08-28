@@ -26,12 +26,60 @@ pub fn show(
         .show(ui, |ui| {
             section(ui, "Light", |ui| {
                 grid(ui, "light_grid", |ui| {
-                    slider_row(ui, &mut changed, "Exposure", &mut params.exposure, -5.0..=5.0, 2, 0.0);
-                    slider_row(ui, &mut changed, "Contrast", &mut params.contrast, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Highlights", &mut params.highlights, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Shadows", &mut params.shadows, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Whites", &mut params.whites, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Blacks", &mut params.blacks, -100.0..=100.0, 0, 0.0);
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Exposure",
+                        &mut params.exposure,
+                        -5.0..=5.0,
+                        2,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Contrast",
+                        &mut params.contrast,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Highlights",
+                        &mut params.highlights,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Shadows",
+                        &mut params.shadows,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Whites",
+                        &mut params.whites,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Blacks",
+                        &mut params.blacks,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
                 });
             });
 
@@ -43,18 +91,53 @@ pub fn show(
 
             section(ui, "Levels", |ui| {
                 grid(ui, "levels_grid", |ui| {
-                    slider_row(ui, &mut changed, "In Black", &mut params.lv_in_black, 0.0..=0.45, 2, 0.0);
-                    slider_row(ui, &mut changed, "In White", &mut params.lv_in_white, 0.55..=1.0, 2, 1.0);
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "In Black",
+                        &mut params.lv_in_black,
+                        0.0..=0.45,
+                        2,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "In White",
+                        &mut params.lv_in_white,
+                        0.55..=1.0,
+                        2,
+                        1.0,
+                    );
                     gamma_row(ui, &mut changed, &mut params.lv_gamma);
-                    slider_row(ui, &mut changed, "Out Black", &mut params.lv_out_black, 0.0..=0.45, 2, 0.0);
-                    slider_row(ui, &mut changed, "Out White", &mut params.lv_out_white, 0.55..=1.0, 2, 1.0);
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Out Black",
+                        &mut params.lv_out_black,
+                        0.0..=0.45,
+                        2,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Out White",
+                        &mut params.lv_out_white,
+                        0.55..=1.0,
+                        2,
+                        1.0,
+                    );
                 });
             });
 
             section(ui, "Color", |ui| {
                 ui.horizontal(|ui| {
                     if ui
-                        .add(egui::SelectableLabel::new(eyedropper_active, "💧 WB picker"))
+                        .add(egui::SelectableLabel::new(
+                            eyedropper_active,
+                            "💧 WB picker",
+                        ))
                         .on_hover_text("Click a neutral gray in the photo to set white balance")
                         .clicked()
                     {
@@ -62,10 +145,42 @@ pub fn show(
                     }
                 });
                 grid(ui, "color_grid", |ui| {
-                    slider_row(ui, &mut changed, "Temp", &mut params.temp, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Tint", &mut params.tint, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Vibrance", &mut params.vibrance, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Saturation", &mut params.saturation, -100.0..=100.0, 0, 0.0);
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Temp",
+                        &mut params.temp,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Tint",
+                        &mut params.tint,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Vibrance",
+                        &mut params.vibrance,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Saturation",
+                        &mut params.saturation,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
                 });
             });
 
@@ -74,27 +189,115 @@ pub fn show(
                 ui.add_space(4.0);
                 let band = &mut params.hsl[*active_band];
                 grid(ui, "mixer_grid", |ui| {
-                    slider_row(ui, &mut changed, "Hue", &mut band.hue, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Saturation", &mut band.sat, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Luminance", &mut band.lum, -100.0..=100.0, 0, 0.0);
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Hue",
+                        &mut band.hue,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Saturation",
+                        &mut band.sat,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Luminance",
+                        &mut band.lum,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
                 });
             });
 
             section(ui, "Detail", |ui| {
                 grid(ui, "detail_grid", |ui| {
-                    slider_row(ui, &mut changed, "Texture", &mut params.texture, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Clarity", &mut params.clarity, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Sharpen", &mut params.sharpen, 0.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "  Radius", &mut params.sharpen_radius, 0.5..=3.0, 1, 1.0);
-                    slider_row(ui, &mut changed, "Luminance NR", &mut params.luminance_nr, 0.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Color NR", &mut params.color_nr, 0.0..=100.0, 0, 0.0);
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Texture",
+                        &mut params.texture,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Clarity",
+                        &mut params.clarity,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Sharpen",
+                        &mut params.sharpen,
+                        0.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "  Radius",
+                        &mut params.sharpen_radius,
+                        0.5..=3.0,
+                        1,
+                        1.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Luminance NR",
+                        &mut params.luminance_nr,
+                        0.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Color NR",
+                        &mut params.color_nr,
+                        0.0..=100.0,
+                        0,
+                        0.0,
+                    );
                 });
             });
 
             section(ui, "Effects", |ui| {
                 grid(ui, "effects_grid", |ui| {
-                    slider_row(ui, &mut changed, "Dehaze", &mut params.dehaze, -100.0..=100.0, 0, 0.0);
-                    slider_row(ui, &mut changed, "Vignette", &mut params.vignette, -100.0..=100.0, 0, 0.0);
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Dehaze",
+                        &mut params.dehaze,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
+                    slider_row(
+                        ui,
+                        &mut changed,
+                        "Vignette",
+                        &mut params.vignette,
+                        -100.0..=100.0,
+                        0,
+                        0.0,
+                    );
                 });
             });
         });
@@ -171,11 +374,8 @@ fn band_picker(ui: &mut egui::Ui, active_band: &mut usize) {
     ui.horizontal_wrapped(|ui| {
         for i in 0..8 {
             let (r, g, b) = hsl_to_rgb(HSL_BAND_HUES[i], 0.75, 0.5);
-            let color = egui::Color32::from_rgb(
-                (r * 255.0) as u8,
-                (g * 255.0) as u8,
-                (b * 255.0) as u8,
-            );
+            let color =
+                egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8);
             let selected = *active_band == i;
             let size = egui::vec2(22.0, 22.0);
             let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());

@@ -4,7 +4,7 @@ Status of the original "future adds" list. Percentages are judgement calls about
 how much of the *feature as a user would expect it* exists, not how much code is
 written.
 
-**Overall: 9 of 10 shipped — roughly 90% of the roadmap, with the GPU rewrite the
+**Overall: 9 of 10 shipped — roughly 92% of the roadmap, with the GPU rewrite the
 only untouched item.**
 
 | # | Feature | Done | Status |
@@ -13,7 +13,7 @@ only untouched item.**
 | 2 | [Copy/paste edits & batch export](#2-copypaste-edits--batch-export) | 100% | ✅ Shipped |
 | 3 | [Presets](#3-presets) | 100% | ✅ Shipped |
 | 4 | [Tone curve](#4-tone-curve) | 100% | ✅ Shipped |
-| 5 | [Local adjustments](#5-local-adjustments) | 85% | ✅ Shipped, refinements open |
+| 5 | [Local adjustments](#5-local-adjustments) | 100% | ✅ Shipped |
 | 6 | [Sharpening & noise reduction](#6-sharpening--noise-reduction) | 85% | ✅ Shipped, refinements open |
 | 7 | [White-balance eyedropper](#7-white-balance-eyedropper) | 100% | ✅ Shipped |
 | 8 | [EXIF panel + ratings/flags](#8-exif-panel--star-ratingsflags) | 85% | ✅ Shipped, culling workflow open |
@@ -72,28 +72,52 @@ Nothing outstanding.
 
 ## 5. Local adjustments
 
-**85% — shipped; the mask *kinds* are the gap, not the plumbing.**
+**100% — done.**
 
-Linear gradient, radial gradient, and freehand brush masks all work. Linear and
-radial are evaluated analytically per pixel from normalized coordinates
-([ops/mask.rs](src/engine/ops/mask.rs)), so they cost nothing to store and are
-resolution-independent; brush dabs are stored in normalized image space and
-rasterized into whatever buffer is being rendered. Masks are draggable (or
-paintable) directly in the preview, can be inverted, enabled/disabled, and
-stacked. Each carries its own exposure / contrast / highlights / shadows /
-whites / blacks / temp / tint / saturation / clarity / sharpness, blended by
-mask weight in [ops/local.rs](src/engine/ops/local.rs).
+A mask is a list of shapes plus a content-based refinement, all folded into one
+0..1 weight per pixel in [ops/mask.rs](src/engine/ops/mask.rs) and applied by
+[ops/local.rs](src/engine/ops/local.rs).
 
-Outstanding:
+- [x] **Shapes** — linear gradient, radial gradient, freehand brush. Linear and
+      radial are evaluated analytically from normalized coordinates, so they
+      cost nothing to store and are resolution-independent; brush dabs are
+      stored in normalized image space and rasterized into whatever buffer is
+      being rendered. All are dragged (or painted) directly in the preview.
+- [x] **Mask composition** — a mask holds any number of shapes, folded in order
+      with add (`w + c − wc`), subtract (`w(1 − c)`) or intersect (`wc`). The
+      first shape sets the base. Shapes and whole masks invert independently.
+      Each shape is outlined in the preview in a color keyed to its operator.
+- [x] **Range masks** — a luminance band and a hue target (with feathering, a
+      saturation gate, and a color picker that reads the pixel you click).
+      A mask with *no* shapes is legal and selects the whole frame, so a range
+      alone can drive it — that is how you reach "every green pixel".
+- [x] **More local sliders** — the set is now exposure, contrast, highlights,
+      shadows, whites, blacks, temp, tint, vibrance, saturation, texture,
+      clarity, dehaze, sharpness, and noise reduction. Texture, clarity and
+      sharpness each get their own blur radius; noise blends toward a
+      full-strength bilateral denoise of the buffer.
+- [x] **Brush auto-mask** — a dab captures the color under the cursor when it is
+      painted and only covers pixels close to it (luma-weighted, so it stops at
+      brightness edges as readily as hue ones). Storing the reference at paint
+      time rather than sampling it at render time is what makes a stroke resolve
+      identically in the preview, in a zoomed region, and in the export.
+- [x] **Show mask coverage** — washes exactly what the mask selects in red over
+      the photo. The coverage travels from the worker as its own alpha map
+      rather than being baked into the pixels, so the preview the brush samples
+      for auto-masking stays the real render.
 
-- [ ] **Mask composition** — add/subtract components within a single mask
-      (Lightroom's "Intersect with" / "Subtract"). Today one mask is one shape
-      plus an invert flag.
-- [ ] **Range masks** — color range and luminance range, the two that make
-      brush work forgiving.
-- [ ] **More local sliders** — dehaze, vibrance, and noise reduction aren't in
-      `LocalAdjust` yet.
-- [ ] Brush auto-mask / edge detection.
+Sidecars written before composition existed still load: a mask that stored a
+single `kind` becomes a one-component mask (see `MaskRepr` in
+[params.rs](src/engine/params.rs)).
+
+Nothing outstanding. Further ideas, none of them required:
+
+- [ ] Subject / sky detection to seed a mask automatically (needs a model).
+- [ ] Reorder shapes within a mask by dragging.
+- [ ] Duplicate a mask, or copy one between photos on its own.
+- [ ] The coverage overlay re-rasterizes brush dabs that the render itself has
+      already rasterized, so painting with it on costs roughly double. Worth
+      threading the render's coverage buffers out if it ever feels slow.
 
 ## 6. Sharpening & noise reduction
 

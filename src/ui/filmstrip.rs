@@ -31,10 +31,8 @@ pub fn show(
                             let tex_size = tex.size_vec2();
                             let scale = (target_w / tex_size.x).min(1.5);
                             let size = tex_size * scale;
-                            let image = egui::Image::new(egui::load::SizedTexture::new(
-                                tex.id(),
-                                size,
-                            ));
+                            let image =
+                                egui::Image::new(egui::load::SizedTexture::new(tex.id(), size));
                             ui.add(egui::ImageButton::new(image).selected(is_selected))
                         }
                         None => {
@@ -43,11 +41,8 @@ pub fn show(
                                 egui::vec2(target_w, target_w * 0.66),
                                 egui::Sense::click(),
                             );
-                            ui.painter().rect_filled(
-                                rect,
-                                4.0,
-                                ui.visuals().extreme_bg_color,
-                            );
+                            ui.painter()
+                                .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
                             ui.painter().text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,

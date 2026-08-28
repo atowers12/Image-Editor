@@ -57,8 +57,11 @@ impl Default for Tuning {
 
 impl Tuning {
     pub fn settings_path() -> Option<PathBuf> {
-        std::env::var_os("APPDATA")
-            .map(|appdata| PathBuf::from(appdata).join("photo-editor").join("settings.json"))
+        std::env::var_os("APPDATA").map(|appdata| {
+            PathBuf::from(appdata)
+                .join("photo-editor")
+                .join("settings.json")
+        })
     }
 
     /// Load saved settings; any missing/corrupt file falls back to defaults.

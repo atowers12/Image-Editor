@@ -1,5 +1,9 @@
 # Photo Editor
 
+<p align="center">
+  <img src="LOGO%202.jpg" alt="Photo Editor icon" width="160" height="160">
+</p>
+
 A light, portable, photo editor written in Rust, using [egui/eframe](https://github.com/emilk/egui)
 for the interface. This project is made to be extended, full source code is available here. If you have any additions you would like to see - fork the repo and add them! Non-destructive by design: your original files are never modified.
 
@@ -23,10 +27,20 @@ for the interface. This project is made to be extended, full source code is avai
   - *Detail*: texture, clarity, sharpening (amount + radius), luminance noise
     reduction (bilateral), color noise reduction
   - *Effects*: dehaze, vignette
-- **Local adjustments (masking)**: linear gradient, radial gradient, and freehand
-  brush masks, each with its own exposure/contrast/highlights/shadows/whites/blacks/
-  temp/tint/saturation/clarity/sharpness — drag the mask shape (or paint) directly
-  in the preview; masks can be inverted and stacked
+- **Local adjustments (masking)**: a mask is any number of shapes — linear gradient,
+  radial gradient, freehand brush — composed with **add / subtract / intersect**, so
+  you can brighten a sky with a gradient and carve the mountains back out of it.
+  Drag a shape (or paint) directly in the preview; shapes and whole masks can be
+  inverted, and masks stack.
+  - *Range masks* narrow a mask by pixel content — a luminance band, a target hue
+    (with a color picker), or both. A mask needs no shape at all if a range defines
+    it, which is how you reach "every green pixel in the frame".
+  - *Auto mask* makes a brush stroke remember the color under the cursor and paint
+    only matching pixels, so it stops at edges instead of spilling over them.
+  - *Show mask coverage* washes exactly what the mask selects in red over the photo.
+  - Each mask carries exposure, contrast, highlights, shadows, whites, blacks, temp,
+    tint, vibrance, saturation, texture, clarity, dehaze, sharpness, and noise
+    reduction.
 - **Presets**: save the current look as a named preset and apply it to any photo
   (stored as JSON in `%APPDATA%\photo-editor\presets`)
 - **Ratings & flags**: 0–5 stars and pick/reject flags (keys `0`–`5`, `P`, `X`),
@@ -91,6 +105,10 @@ optimizations because pixel processing is far too slow without them.
 | Tone curve | Drag on the curve to add/move points; right-click a point to remove it; switch RGB/R/G/B above |
 | White balance picker | **💧 WB picker** in Color, then click a neutral gray in the photo |
 | Local adjustments | **✦ Mask**, add a Linear/Radial/Brush mask, drag its shape (or paint) in the preview, set its sliders |
+| Compose a mask | In the mask's **Shapes** list, **Add** another shape and set its dropdown to Add, Subtract or Intersect; click a row to edit that shape in the preview |
+| See what a mask selects | **Show mask coverage** at the top of the mask panel |
+| Mask by color / brightness | Open **Range** on the mask; **💧 Pick color** targets the hue you click |
+| Brush around edges | Tick **Auto mask** before painting |
 | Rate / flag | Keys `0`–`5` for stars, `P` pick, `X` reject (also clickable in the panel) |
 | Presets | **🎨 Presets** — apply a saved look or save the current one |
 | Undo / redo | `Ctrl+Z` / `Ctrl+Y` (also the ↶ ↷ buttons) |
@@ -122,7 +140,8 @@ src/
       hsl.rs          the 8-band color mixer
       detail.rs       texture, clarity, dehaze
       sharpen.rs      unsharp sharpening, bilateral luma NR, chroma NR
-      mask.rs         linear/radial/brush mask coverage
+      mask.rs         shape coverage, add/subtract/intersect folding, range
+                      masks, auto-masked brush dabs
       local.rs        per-pixel local adjustments blended by mask weight
       vignette.rs     radial falloff (normalized coords, region-safe)
       geometry.rs     90° orientation, flips, straighten, crop
@@ -138,7 +157,7 @@ src/
     adjustments.rs    grouped slider panel (Light/Curve/Levels/Color/Mixer/Detail/Effects)
     curve.rs          interactive tone-curve widget
     crop.rs           crop tool panel: rotate/flip/straighten/aspect
-    masks.rs          local-adjustment mask list + editor panel
+    masks.rs          mask list, shape composition, range mask, local sliders
     filmstrip.rs      thumbnail strip with rating/flag badges
     histogram.rs      histogram plot + clipping toggles
     info.rs           star rating / flag controls + EXIF panel
@@ -158,11 +177,17 @@ src/
   ranges → contrast → levels → tone curve → noise reduction → texture/clarity/sharpen
   (unsharp masks against blurred luminance) → color mixer → dehaze → vibrance /
   saturation → local masked adjustments → vignette.
-- **Local adjustments** run in the same position-aware pass as the vignette: linear
-  and radial masks are evaluated analytically per pixel (so they cost nothing to
-  store and are resolution-independent), while brush masks are rasterized from their
-  dabs into the current render buffer. Each mask computes a 0..1 weight and the local
-  result is blended in by that weight.
+- **Local adjustments** run in the same position-aware pass as the vignette. Linear
+  and radial shapes are evaluated analytically per pixel (so they cost nothing to
+  store and are resolution-independent), while brush shapes are rasterized from their
+  dabs into the current render buffer. A mask's shapes are folded together in order —
+  the first sets the base coverage, then each later one adds (`w + c − wc`), subtracts
+  (`w(1 − c)`) or intersects (`wc`) — then the whole thing is inverted if asked, and
+  finally multiplied by the range mask's verdict on that pixel's luminance and hue.
+  The result is a 0..1 weight, and the local adjustment is blended in by it.
+  Auto-masked brush dabs store the reference color captured when they were *painted*
+  rather than sampling at render time, so a stroke resolves identically in the
+  preview, in a zoomed region, and in the export.
 - **Interactivity**: the UI thread never touches pixels. A worker thread owns the
   decoded image plus a preview-sized copy; slider changes send parameters over a
   channel, stale requests are dropped, and only the newest state is rendered
@@ -182,3 +207,7 @@ src/
 A pretty-printed JSON serialization of `EditParams` — safe to inspect, diff, or
 delete. Deleting a sidecar simply reverts the photo to its unedited state. Unknown
 or missing fields are tolerated, so sidecars stay compatible across app versions.
+
+Where a field's shape has genuinely changed, the old one is still read and migrated
+on load: masks used to hold a single `kind` before they could compose several
+shapes, and such a mask now loads with that shape as its first component.

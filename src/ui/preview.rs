@@ -7,6 +7,10 @@
 //!   full-res source and draw that texture over the soft preview.
 //! - Crop overlay: while the crop tool is open, an interactive rect with
 //!   corner/edge handles edits `EditParams::crop` in place.
+//! - Mask overlay: while a mask is open, every shape composed into it is
+//!   outlined and the selected one takes drags (or brush strokes).
+
+use crate::engine::params::{Dab, MaskComponent, MaskKind, MaskOp};
 
 pub struct PreviewState {
     pub fit: bool,
@@ -66,11 +70,42 @@ pub struct CropOverlay<'a> {
     pub dims: (usize, usize),
 }
 
-/// Editing handle for the selected local-adjustment mask, drawn over the
-/// preview. Radial/linear masks expose drag handles; brush masks paint.
+/// The rendered preview's pixels, so the brush can read the color it is
+/// painting over. sRGB bytes, matching what the pipeline's buffer holds.
+#[derive(Clone, Copy)]
+pub struct PreviewPixels<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: &'a [u8],
+}
+
+impl PreviewPixels<'_> {
+    /// The color at a normalized image point, as gamma RGB in 0..1.
+    fn sample(&self, n: [f32; 2]) -> Option<[f32; 3]> {
+        if self.width == 0 || self.height == 0 {
+            return None;
+        }
+        let x = ((n[0] * self.width as f32) as usize).min(self.width - 1);
+        let y = ((n[1] * self.height as f32) as usize).min(self.height - 1);
+        let i = (y * self.width + x) * 4;
+        let p = self.rgba.get(i..i + 3)?;
+        Some([
+            p[0] as f32 / 255.0,
+            p[1] as f32 / 255.0,
+            p[2] as f32 / 255.0,
+        ])
+    }
+}
+
+/// Editing handles for the selected local-adjustment mask, drawn over the
+/// preview. Every shape in the mask is outlined so the composition reads at a
+/// glance; only the selected one takes drags (or paint).
 pub struct MaskEditor<'a> {
-    pub kind: &'a mut crate::engine::params::MaskKind,
+    pub components: &'a mut [MaskComponent],
+    /// Index into `components` of the shape being edited.
+    pub selected: usize,
     pub brush: crate::ui::masks::BrushSettings,
+    pub preview: Option<PreviewPixels<'a>>,
 }
 
 #[derive(Default)]
@@ -93,6 +128,9 @@ pub fn show(
     region: Option<(&egui::TextureHandle, [f32; 4])>,
     crop: Option<CropOverlay>,
     mask_edit: Option<MaskEditor>,
+    // Red wash showing what the mask being edited selects, drawn over the
+    // photo at the same extent as the preview itself.
+    coverage: Option<&egui::TextureHandle>,
     eyedropper: bool,
 ) -> PreviewOutput {
     let mut out = PreviewOutput::default();
@@ -188,6 +226,9 @@ pub fn show(
     let img_rect = egui::Rect::from_center_size(rect.center() + state.offset, size);
     let uv_full = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     painter.image(tex.id(), img_rect, uv_full, egui::Color32::WHITE);
+    if let Some(cov) = coverage {
+        painter.image(cov.id(), img_rect, uv_full, egui::Color32::WHITE);
+    }
 
     // --- Region of interest: sharpen what's visible when zoomed in ---
     let displayed_soft = img_rect.width() > img_size.x * 1.05;
@@ -208,7 +249,9 @@ pub fn show(
                 // Pad so small pans don't immediately hit soft edges.
                 let pad_x = visible.width() * 0.15;
                 let pad_y = visible.height() * 0.15;
-                let padded = visible.expand2(egui::vec2(pad_x, pad_y)).intersect(img_rect);
+                let padded = visible
+                    .expand2(egui::vec2(pad_x, pad_y))
+                    .intersect(img_rect);
                 let nx = (padded.min.x - img_rect.min.x) / img_rect.width();
                 let ny = (padded.min.y - img_rect.min.y) / img_rect.height();
                 let nw = padded.width() / img_rect.width();
@@ -228,27 +271,34 @@ pub fn show(
         }
     }
 
-    // --- Crop overlay ---
+    // --- Editing overlays ---
     if let Some(c) = crop {
         out.crop_changed = crop_overlay(ui, state, &painter, &resp, img_rect, c);
-    } else if let Some(m) = mask_edit {
-        out.mask_changed = mask_overlay(ui, &painter, &resp, img_rect, m);
     } else {
         state.crop_drag = None;
-        // Eyedropper: click samples a normalized image point.
-        if eyedropper {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-            if resp.clicked() {
-                if let Some(p) = resp.interact_pointer_pos() {
-                    if img_rect.contains(p) {
-                        out.eyedrop_point = Some([
-                            ((p.x - img_rect.min.x) / img_rect.width()).clamp(0.0, 1.0),
-                            ((p.y - img_rect.min.y) / img_rect.height()).clamp(0.0, 1.0),
-                        ]);
-                    }
+        if let Some(m) = mask_edit {
+            // With the eyedropper armed the mask is drawn but not editable,
+            // so a click samples a color instead of dragging or painting.
+            out.mask_changed = mask_overlay(ui, &painter, &resp, img_rect, m, !eyedropper);
+        }
+    }
+
+    // --- Eyedropper: a click samples a normalized image point ---
+    if eyedropper && !cropping {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                if img_rect.contains(p) {
+                    out.eyedrop_point = Some([
+                        ((p.x - img_rect.min.x) / img_rect.width()).clamp(0.0, 1.0),
+                        ((p.y - img_rect.min.y) / img_rect.height()).clamp(0.0, 1.0),
+                    ]);
                 }
             }
         }
+    }
+
+    if !overlay_mode {
         // Zoom readout, bottom-left.
         let label = if state.fit {
             "Fit".to_string()
@@ -327,11 +377,17 @@ fn crop_overlay(
         let fx = crop_rect.min.x + crop_rect.width() * i as f32 / 3.0;
         let fy = crop_rect.min.y + crop_rect.height() * i as f32 / 3.0;
         painter.line_segment(
-            [egui::pos2(fx, crop_rect.min.y), egui::pos2(fx, crop_rect.max.y)],
+            [
+                egui::pos2(fx, crop_rect.min.y),
+                egui::pos2(fx, crop_rect.max.y),
+            ],
             thin,
         );
         painter.line_segment(
-            [egui::pos2(crop_rect.min.x, fy), egui::pos2(crop_rect.max.x, fy)],
+            [
+                egui::pos2(crop_rect.min.x, fy),
+                egui::pos2(crop_rect.max.x, fy),
+            ],
             thin,
         );
     }
@@ -489,9 +545,7 @@ fn apply_crop_drag(crop: &mut [f32; 4], handle: Handle, dn: egui::Vec2, aspect: 
                     nh = (nw / a).max(MIN_CROP);
                     match handle {
                         Handle::NE | Handle::NW => ny = bottom - nh,
-                        Handle::E | Handle::W => {
-                            ny = (y + (h - nh) * 0.5).clamp(0.0, 1.0 - nh)
-                        }
+                        Handle::E | Handle::W => ny = (y + (h - nh) * 0.5).clamp(0.0, 1.0 - nh),
                         _ => {}
                     }
                 }
@@ -507,34 +561,104 @@ fn apply_crop_drag(crop: &mut [f32; 4], handle: Handle, dn: egui::Vec2, aspect: 
     *crop = [nx, ny, nw, nh];
 }
 
-/// Draw and edit the selected mask over the image. Returns true if the
-/// mask geometry (or brush strokes) changed.
+/// Screen position of a normalized image point.
+fn norm_to_screen(img_rect: egui::Rect, p: [f32; 2]) -> egui::Pos2 {
+    egui::pos2(
+        img_rect.min.x + p[0] * img_rect.width(),
+        img_rect.min.y + p[1] * img_rect.height(),
+    )
+}
+
+/// The color a shape is outlined in, keyed to what it does to the mask:
+/// blue adds, red carves away, green keeps only the overlap.
+fn component_color(op: MaskOp, active: bool) -> egui::Color32 {
+    let base = match op {
+        MaskOp::Add => egui::Color32::from_rgb(120, 200, 255),
+        MaskOp::Subtract => egui::Color32::from_rgb(255, 140, 140),
+        MaskOp::Intersect => egui::Color32::from_rgb(150, 240, 170),
+    };
+    if active {
+        base
+    } else {
+        base.gamma_multiply(0.5)
+    }
+}
+
+/// Outline one shape without any interactive handles — how the shapes that
+/// aren't currently selected are shown.
+fn draw_component_outline(
+    painter: &egui::Painter,
+    img_rect: egui::Rect,
+    c: &MaskComponent,
+    color: egui::Color32,
+) {
+    let stroke = egui::Stroke::new(1.0, color);
+    match &c.kind {
+        MaskKind::Radial { center, radius, .. } => {
+            draw_ellipse(
+                painter,
+                norm_to_screen(img_rect, *center),
+                radius[0] * img_rect.width(),
+                radius[1] * img_rect.height(),
+                stroke,
+            );
+        }
+        MaskKind::Linear { p0, p1 } => {
+            painter.line_segment(
+                [
+                    norm_to_screen(img_rect, *p0),
+                    norm_to_screen(img_rect, *p1),
+                ],
+                stroke,
+            );
+        }
+        // Brush strokes have no outline; the red coverage overlay in the
+        // panel is how you see where they landed.
+        MaskKind::Brush { .. } => {}
+    }
+}
+
+/// Draw the mask's whole composition over the image and edit the selected
+/// shape. Returns true if the geometry (or the brush strokes) changed.
+/// With `interact` false the shapes are drawn but take no input, which is
+/// what lets the eyedropper claim clicks while a mask is open.
 fn mask_overlay(
     ui: &egui::Ui,
     painter: &egui::Painter,
     resp: &egui::Response,
     img_rect: egui::Rect,
     m: MaskEditor,
+    interact: bool,
 ) -> bool {
-    use crate::engine::params::{Dab, MaskKind};
-
-    let to_screen = |p: [f32; 2]| {
-        egui::pos2(
-            img_rect.min.x + p[0] * img_rect.width(),
-            img_rect.min.y + p[1] * img_rect.height(),
-        )
-    };
+    let to_screen = |p: [f32; 2]| norm_to_screen(img_rect, p);
     let to_norm = |p: egui::Pos2| {
         [
             ((p.x - img_rect.min.x) / img_rect.width()).clamp(0.0, 1.0),
             ((p.y - img_rect.min.y) / img_rect.height()).clamp(0.0, 1.0),
         ]
     };
-    let line = egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255));
+
+    // The first shape is the base, so it always reads as an "add".
+    let op_of = |i: usize, c: &MaskComponent| if i == 0 { MaskOp::Add } else { c.op };
+
+    let (selected, brush, preview) = (m.selected, m.brush, m.preview);
+    for (i, c) in m.components.iter().enumerate() {
+        if i != selected {
+            draw_component_outline(painter, img_rect, c, component_color(op_of(i, c), false));
+        }
+    }
+
+    let Some(active_op) = m.components.get(selected).map(|c| op_of(selected, c)) else {
+        return false;
+    };
+    let line = egui::Stroke::new(1.5, component_color(active_op, true));
     let handle_fill = egui::Color32::from_gray(245);
     let mut changed = false;
+    let Some(component) = m.components.get_mut(selected) else {
+        return false;
+    };
 
-    match m.kind {
+    match &mut component.kind {
         MaskKind::Radial {
             center,
             radius,
@@ -562,7 +686,7 @@ fn mask_overlay(
 
             let drag_id = ui.id().with("radial_handle");
             let mut which: Option<u8> = ui.data(|d| d.get_temp(drag_id)).flatten();
-            if resp.drag_started() {
+            if interact && resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     which = if p.distance(h_right) < 12.0 {
                         Some(1)
@@ -573,16 +697,14 @@ fn mask_overlay(
                     };
                 }
             }
-            if resp.dragged() {
+            if interact && resp.dragged() {
                 if let (Some(w), Some(p)) = (which, resp.interact_pointer_pos()) {
                     match w {
                         1 => {
-                            radius[0] =
-                                ((p.x - c.x).abs() / img_rect.width()).clamp(0.02, 1.0);
+                            radius[0] = ((p.x - c.x).abs() / img_rect.width()).clamp(0.02, 1.0);
                         }
                         2 => {
-                            radius[1] =
-                                ((p.y - c.y).abs() / img_rect.height()).clamp(0.02, 1.0);
+                            radius[1] = ((p.y - c.y).abs() / img_rect.height()).clamp(0.02, 1.0);
                         }
                         _ => *center = to_norm(p),
                     }
@@ -614,7 +736,7 @@ fn mask_overlay(
 
             let drag_id = ui.id().with("linear_handle");
             let mut which: Option<u8> = ui.data(|d| d.get_temp(drag_id)).flatten();
-            if resp.drag_started() {
+            if interact && resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     which = if p.distance(a) < 14.0 {
                         Some(0)
@@ -625,7 +747,7 @@ fn mask_overlay(
                     };
                 }
             }
-            if resp.dragged() {
+            if interact && resp.dragged() {
                 if let (Some(w), Some(p)) = (which, resp.interact_pointer_pos()) {
                     match w {
                         0 => *p0 = to_norm(p),
@@ -648,25 +770,43 @@ fn mask_overlay(
             ui.data_mut(|d| d.insert_temp(drag_id, which));
         }
         MaskKind::Brush { dabs } => {
+            if !interact {
+                return false;
+            }
             // Draw a cursor circle and paint dabs while dragging.
             if let Some(p) = resp.hover_pos() {
-                let r = m.brush.radius * img_rect.width();
-                let col = if m.brush.erase {
+                let r = brush.radius * img_rect.width();
+                let col = if brush.erase {
                     egui::Color32::from_rgb(255, 140, 140)
                 } else {
                     egui::Color32::from_rgb(140, 220, 255)
                 };
                 painter.circle_stroke(p, r, egui::Stroke::new(1.0, col));
+                // A second ring marks auto-masking, which restricts the dab
+                // to pixels matching whatever is under the cursor.
+                if brush.auto_mask {
+                    painter.circle_stroke(
+                        p,
+                        r + 3.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70)),
+                    );
+                }
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
             }
             if resp.dragged() || resp.drag_started() {
                 if let Some(p) = resp.interact_pointer_pos() {
                     if img_rect.contains(p) {
+                        let at = to_norm(p);
                         dabs.push(Dab {
-                            p: to_norm(p),
-                            radius: m.brush.radius,
-                            hardness: m.brush.hardness,
-                            erase: m.brush.erase,
+                            p: at,
+                            radius: brush.radius,
+                            hardness: brush.hardness,
+                            erase: brush.erase,
+                            // Erasing is unconditional; only painted dabs
+                            // carry a reference color to match against.
+                            auto: (brush.auto_mask && !brush.erase)
+                                .then(|| preview.and_then(|pv| pv.sample(at)))
+                                .flatten(),
                         });
                         changed = true;
                     }
@@ -679,7 +819,13 @@ fn mask_overlay(
 }
 
 /// Draw an axis-aligned ellipse as a closed polyline.
-fn draw_ellipse(painter: &egui::Painter, center: egui::Pos2, rx: f32, ry: f32, stroke: egui::Stroke) {
+fn draw_ellipse(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    rx: f32,
+    ry: f32,
+    stroke: egui::Stroke,
+) {
     const N: usize = 48;
     let pts: Vec<egui::Pos2> = (0..=N)
         .map(|i| {
