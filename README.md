@@ -97,22 +97,22 @@ optimizations because pixel processing is far too slow without them.
 | Reset one slider | Double-click it (or right-click → Reset) |
 | Reset everything | **↺ Reset All** in the top bar |
 | Crop / rotate | **✂ Crop**, then drag the frame's corners/edges; rotate, flip, straighten, and lock aspect in the panel; **✔ Done** to apply |
-| Compare | **◧ Before** toggles the unedited view |
+| Compare | **◑ Before** toggles the unedited view |
 | Zoom | Mouse wheel (anchored at the cursor), or pinch — the zoom readout shows % of true full resolution |
 | Pan | Drag the image while zoomed |
 | Fit ⇄ 100% | Double-click the image |
 | Clipping warnings | Click the dots in the histogram corners: left = shadows (blue), right = highlights (red) |
 | Tone curve | Drag on the curve to add/move points; right-click a point to remove it; switch RGB/R/G/B above |
 | White balance picker | **💧 WB picker** in Color, then click a neutral gray in the photo |
-| Local adjustments | **✦ Mask**, add a Linear/Radial/Brush mask, drag its shape (or paint) in the preview, set its sliders |
+| Local adjustments | **◎ Mask**, add a Linear/Radial/Brush mask, drag its shape (or paint) in the preview, set its sliders |
 | Compose a mask | In the mask's **Shapes** list, **Add** another shape and set its dropdown to Add, Subtract or Intersect; click a row to edit that shape in the preview |
 | See what a mask selects | **Show mask coverage** at the top of the mask panel |
 | Mask by color / brightness | Open **Range** on the mask; **💧 Pick color** targets the hue you click |
 | Brush around edges | Tick **Auto mask** before painting |
 | Rate / flag | Keys `0`–`5` for stars, `P` pick, `X` reject (also clickable in the panel) |
 | Presets | **🎨 Presets** — apply a saved look or save the current one |
-| Undo / redo | `Ctrl+Z` / `Ctrl+Y` (also the ↶ ↷ buttons) |
-| Copy edits | **⧉ Copy**, then **📋 Paste** on another photo, or **📋 All** for the whole folder |
+| Undo / redo | `Ctrl+Z` / `Ctrl+Y` (also the ↩ ↪ buttons) |
+| Copy edits | **🗐 Copy**, then **📋 Paste** on another photo, or **📋 All** for the whole folder |
 | Export | **💾 Export…** — current photo or all photos, format/quality, destination |
 | Tune the engine | **⚙** — effect strengths, blur radii, vignette shape, preview size |
 

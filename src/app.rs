@@ -663,18 +663,18 @@ impl App {
             }
 
             self.mode_toggle(ui, has_photo, Mode::Crop, "✂ Crop");
-            self.mode_toggle(ui, has_photo, Mode::Mask, "✦ Mask");
+            self.mode_toggle(ui, has_photo, Mode::Mask, "◎ Mask");
 
             // Undo / redo.
             if ui
-                .add_enabled(!self.undo.is_empty(), egui::Button::new("↶"))
+                .add_enabled(!self.undo.is_empty(), egui::Button::new("↩"))
                 .on_hover_text("Undo (Ctrl+Z)")
                 .clicked()
             {
                 self.undo();
             }
             if ui
-                .add_enabled(!self.redo.is_empty(), egui::Button::new("↷"))
+                .add_enabled(!self.redo.is_empty(), egui::Button::new("↪"))
                 .on_hover_text("Redo (Ctrl+Y)")
                 .clicked()
             {
@@ -685,7 +685,7 @@ impl App {
             if ui
                 .add_enabled(
                     has_photo && self.mode == Mode::Adjust,
-                    egui::SelectableLabel::new(before, "◧ Before"),
+                    egui::SelectableLabel::new(before, "◑ Before"),
                 )
                 .clicked()
             {
@@ -711,7 +711,7 @@ impl App {
             ui.separator();
 
             if ui
-                .add_enabled(has_photo, egui::Button::new("⧉ Copy"))
+                .add_enabled(has_photo, egui::Button::new("🗐 Copy"))
                 .on_hover_text("Copy this photo's edit settings")
                 .clicked()
             {
