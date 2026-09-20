@@ -1,6 +1,7 @@
 //! Crop tool side panel: orientation buttons, straighten slider, aspect
-//! lock, reset. The interactive crop rectangle itself lives in the preview
-//! (see preview.rs); this panel edits the rest of the geometry.
+//! lock, the constrain-to-image toggle, reset. The interactive crop
+//! rectangle itself lives in the preview (see preview.rs); this panel edits
+//! the rest of the geometry.
 
 use crate::engine::ops::geometry;
 use crate::engine::params::EditParams;
@@ -96,22 +97,44 @@ pub fn conform_to_aspect(crop: &mut [f32; 4], ratio: f32, dims: (usize, usize)) 
     clamp_crop(crop);
 }
 
+/// Smallest crop, as a fraction of each side. Shared with the preview's
+/// drag handling so both paths agree on what "too small" means.
+pub const MIN_CROP: f32 = 0.03;
+
 pub fn clamp_crop(crop: &mut [f32; 4]) {
-    crop[2] = crop[2].clamp(0.02, 1.0);
-    crop[3] = crop[3].clamp(0.02, 1.0);
+    crop[2] = crop[2].clamp(MIN_CROP, 1.0);
+    crop[3] = crop[3].clamp(MIN_CROP, 1.0);
     crop[0] = crop[0].clamp(0.0, 1.0 - crop[2]);
     crop[1] = crop[1].clamp(0.0, 1.0 - crop[3]);
 }
 
+/// Pull the crop back inside the photo after something moved the frame it
+/// sits in (a new angle, a new aspect, the toggle being switched on).
+/// A no-op when the crop is free to roam, or before the photo's real
+/// dimensions are known. Returns whether it moved.
+fn refit(params: &mut EditParams, constrain: bool, source: Option<(usize, usize)>) -> bool {
+    match source {
+        Some(src) if constrain => geometry::fit_crop_in_frame(&mut params.crop, params.angle, src),
+        _ => false,
+    }
+}
+
 /// The crop tool's controls (shown in the right panel while cropping).
-/// `oriented_dims`: uncropped dims after orientation, for aspect math.
+/// `oriented_dims`: uncropped straightened-canvas dims, for aspect math.
+/// `source_dims`: the frame the straighten angle rotates — the boundary the
+/// constraint tests against. `None` until the photo's real size is known.
+/// `constrain`: keep the crop rectangle inside the photo's real pixels.
 pub fn panel(
     ui: &mut egui::Ui,
     params: &mut EditParams,
     aspect: &mut AspectLock,
+    constrain: &mut bool,
     oriented_dims: (usize, usize),
+    source_dims: Option<(usize, usize)>,
 ) -> CropAction {
     let mut action = CropAction::None;
+    // A quarter turn swaps the frame the straighten rotates.
+    let turned = source_dims.map(|(w, h)| (h, w));
 
     ui.heading("Crop & Rotate");
     ui.add_space(6.0);
@@ -124,6 +147,7 @@ pub fn panel(
         {
             params.rotate90 = (params.rotate90 + 3) % 4;
             params.crop = geometry::crop_rotated_ccw(params.crop);
+            refit(params, *constrain, turned);
             action = CropAction::Changed;
         }
         if ui
@@ -133,6 +157,7 @@ pub fn panel(
         {
             params.rotate90 = (params.rotate90 + 1) % 4;
             params.crop = geometry::crop_rotated_cw(params.crop);
+            refit(params, *constrain, turned);
             action = CropAction::Changed;
         }
     });
@@ -140,11 +165,13 @@ pub fn panel(
         if ui.button("⬌ Flip H").clicked() {
             params.flip_h = !params.flip_h;
             params.crop = geometry::crop_flipped(params.crop, true);
+            refit(params, *constrain, source_dims);
             action = CropAction::Changed;
         }
         if ui.button("⬍ Flip V").clicked() {
             params.flip_v = !params.flip_v;
             params.crop = geometry::crop_flipped(params.crop, false);
+            refit(params, *constrain, source_dims);
             action = CropAction::Changed;
         }
     });
@@ -162,6 +189,11 @@ pub fn panel(
     } else if resp.changed() {
         action = CropAction::Changed;
     }
+    // A new angle re-shapes the canvas and its black corner wedges, which can
+    // leave the crop sitting over them.
+    if matches!(action, CropAction::Changed) {
+        refit(params, *constrain, source_dims);
+    }
 
     ui.add_space(8.0);
     let mut aspect_changed = false;
@@ -177,8 +209,34 @@ pub fn panel(
     if aspect_changed {
         if let Some(ratio) = aspect.ratio(oriented_dims) {
             conform_to_aspect(&mut params.crop, ratio, oriented_dims);
+            refit(params, *constrain, source_dims);
             action = CropAction::Changed;
         }
+    }
+
+    ui.add_space(8.0);
+    if let Some(src) = source_dims {
+        if ui
+            .button("⛶ Fill frame")
+            .on_hover_text(
+                "Grow the crop to the largest one of this shape that fits the \
+                 straightened photo, centred on it",
+            )
+            .clicked()
+        {
+            geometry::fill_frame(&mut params.crop, params.angle, src);
+            action = CropAction::Changed;
+        }
+    }
+
+    ui.add_space(6.0);
+    let constrain_resp = ui.checkbox(constrain, "Constrain to image").on_hover_text(
+        "Keep the crop frame on the photo's real pixels, so a straightened \
+         image never leaves black corners. The limit is drawn in the preview. \
+         Untick to place the frame anywhere on the canvas.",
+    );
+    if constrain_resp.changed() && refit(params, *constrain, source_dims) {
+        action = CropAction::Changed;
     }
 
     ui.add_space(12.0);
@@ -196,7 +254,9 @@ pub fn panel(
     ui.add_space(6.0);
     ui.label(
         egui::RichText::new(
-            "Drag the corners or edges of the frame in the preview; drag inside to move it.",
+            "Drag the corners or edges of the frame in the preview; drag inside to move it. \
+             Drag outside the frame — or middle-drag anywhere — to pan, scroll to zoom, \
+             double-click outside to fit.",
         )
         .small()
         .weak(),
@@ -225,5 +285,24 @@ mod tests {
         clamp_crop(&mut crop);
         assert!(crop[0] + crop[2] <= 1.0 + 1e-6);
         assert!(crop[1] >= 0.0);
+    }
+
+    #[test]
+    fn refit_only_acts_when_constrained_and_sized() {
+        let dims = (4000, 3000);
+        let mut params = EditParams {
+            angle: -28.0,
+            crop: [0.0, 0.0, 1.0, 1.0],
+            ..EditParams::default()
+        };
+        // Unconstrained the crop is left over the black corners.
+        assert!(!refit(&mut params, false, Some(dims)));
+        assert_eq!(params.crop, [0.0, 0.0, 1.0, 1.0]);
+        // Nor is anything guessed before the real dimensions arrive.
+        assert!(!refit(&mut params, true, None));
+        assert_eq!(params.crop, [0.0, 0.0, 1.0, 1.0]);
+        // Constrained, with dimensions, it is pulled inside.
+        assert!(refit(&mut params, true, Some(dims)));
+        assert!(geometry::rect_in_frame(params.crop, -28.0, dims));
     }
 }

@@ -49,7 +49,12 @@ for the interface. This project is made to be extended, full source code is avai
 - **Undo / redo**: full per-photo history (`Ctrl+Z` / `Ctrl+Y`)
 - **Crop & Rotate** (non-destructive): interactive crop with aspect-ratio locks
   (original, 1:1, 3:2, 4:3, 16:9, …), 90° rotation, horizontal/vertical flip,
-  and a ±45° straighten slider with rule-of-thirds grid
+  and a ±45° straighten slider with rule-of-thirds grid. Straightening grows the
+  canvas to the rotated bounding box, so it never clips the corners off your photo.
+  The view zooms and pans while you crop; **Constrain to image** keeps the crop
+  frame on real pixels so a straightened photo never exports black corners (the
+  boundary is drawn, so you can see where it stops); and **Fill frame** grows the
+  crop to the largest one of its shape that fits
 - **Full-resolution zoom**: zooming past the preview's resolution renders the
   visible area from the original pixels in the background, so you always end up
   pixel-sharp — panning stays fluid because the soft preview shows instantly
@@ -97,6 +102,10 @@ optimizations because pixel processing is far too slow without them.
 | Reset one slider | Double-click it (or right-click → Reset) |
 | Reset everything | **↺ Reset All** in the top bar |
 | Crop / rotate | **✂ Crop**, then drag the frame's corners/edges; rotate, flip, straighten, and lock aspect in the panel; **✔ Done** to apply |
+| Move the crop frame | Drag inside it |
+| Pan / zoom while cropping | Drag *outside* the frame, or middle-drag anywhere; wheel or pinch to zoom; double-click outside the frame to fit |
+| Keep the crop on real pixels | **Constrain to image** in the crop panel (on by default) — the frame stops at the photo's straightened edge, drawn as an amber outline, and an out-of-bounds crop is pulled back in, keeping its aspect ratio. Untick to place it freely over the black corners |
+| Use as much photo as possible | **⛶ Fill frame** — grows the crop to the largest one of its current shape (or locked aspect) that fits the straightened photo, centred |
 | Compare | **◑ Before** toggles the unedited view |
 | Zoom | Mouse wheel (anchored at the cursor), or pinch — the zoom readout shows % of true full resolution |
 | Pan | Drag the image while zoomed |
@@ -109,12 +118,37 @@ optimizations because pixel processing is far too slow without them.
 | See what a mask selects | **Show mask coverage** at the top of the mask panel |
 | Mask by color / brightness | Open **Range** on the mask; **💧 Pick color** targets the hue you click |
 | Brush around edges | Tick **Auto mask** before painting |
-| Rate / flag | Keys `0`–`5` for stars, `P` pick, `X` reject (also clickable in the panel) |
+| Rate / flag | Click the stars/flags in the panel, or use the [keyboard shortcuts](#keyboard-shortcuts) |
 | Presets | **🎨 Presets** — apply a saved look or save the current one |
-| Undo / redo | `Ctrl+Z` / `Ctrl+Y` (also the ↩ ↪ buttons) |
+| Undo / redo | The ↩ ↪ buttons, or `Ctrl+Z` / `Ctrl+Y` |
 | Copy edits | **🗐 Copy**, then **📋 Paste** on another photo, or **📋 All** for the whole folder |
 | Export | **💾 Export…** — current photo or all photos, format/quality, destination |
 | Tune the engine | **⚙** — effect strengths, blur radii, vignette shape, preview size |
+
+## Keyboard shortcuts
+
+| Key | Does |
+|---|---|
+| `0` – `5` | Set the star rating (`0` clears it) |
+| `P` | Toggle the **pick** flag |
+| `X` | Toggle the **reject** flag |
+| `Ctrl+Z` | Undo |
+| `Ctrl+Y` *or* `Ctrl+Shift+Z` | Redo |
+
+`P` and `X` toggle: pressing the key that's already set clears the flag, so `X` on a
+rejected photo un-rejects it rather than doing nothing. Setting a rating or a flag is
+an ordinary edit — it lands in the undo history and the sidecar like any slider.
+
+Two things suppress every shortcut above:
+
+- **No photo open.** They're ignored on the welcome screen.
+- **A text field has focus** — in practice the **🎨 Presets** name box, the only one
+  in the app. Keys go to the field instead, so typing "Portrait 2x" as a preset name
+  won't re-rate the photo underneath. Click away from the field to get them back.
+
+`Ctrl` is `⌘` on macOS. Everything else in the app is mouse-driven; see the
+[Usage](#usage) table above, which covers the preview's drag/wheel/double-click
+gestures.
 
 ## How it works
 
@@ -144,7 +178,9 @@ src/
                       masks, auto-masked brush dabs
       local.rs        per-pixel local adjustments blended by mask weight
       vignette.rs     radial falloff (normalized coords, region-safe)
-      geometry.rs     90° orientation, flips, straighten, crop
+      geometry.rs     90° orientation, flips, straighten (into the rotated
+                      bounding box), crop, and the frame tests the crop
+                      constraint, fill-frame and sidecar migration use
   imgio/
     loader.rs         decode (image crate / rawler) → linear-RGB f32
     sidecar.rs        photo.ext.edits.json load/save
@@ -156,12 +192,13 @@ src/
   ui/
     adjustments.rs    grouped slider panel (Light/Curve/Levels/Color/Mixer/Detail/Effects)
     curve.rs          interactive tone-curve widget
-    crop.rs           crop tool panel: rotate/flip/straighten/aspect
+    crop.rs           crop tool panel: rotate/flip/straighten/aspect/constrain
     masks.rs          mask list, shape composition, range mask, local sliders
     filmstrip.rs      thumbnail strip with rating/flag badges
     histogram.rs      histogram plot + clipping toggles
     info.rs           star rating / flag controls + EXIF panel
-    preview.rs        zoom/pan view, full-res region, crop + mask overlays, eyedropper
+    preview.rs        zoom/pan view (including while cropping), full-res region,
+                      crop + mask overlays, eyedropper
     settings.rs       processing settings window (Tuning)
     welcome.rs        start screen (open buttons, recent folders)
     export_dialog.rs  export settings window
@@ -188,6 +225,21 @@ src/
   Auto-masked brush dabs store the reference color captured when they were *painted*
   rather than sampling at render time, so a stroke resolves identically in the
   preview, in a zoomed region, and in the export.
+- **Straighten grows the canvas.** Rotating a rectangle inside its own dimensions
+  pushes its four corners outside them, so straightening into a same-sized canvas
+  would clip real pixels off every edge *as well as* adding black corners. Instead
+  `rotate_angle` renders into the rotated bounding box (`straightened_dims`), which
+  keeps every source pixel; the only dead area is the four corner wedges. The crop
+  rectangle is normalized against that grown canvas.
+- **The crop constraint**: **Constrain to image** keeps the crop off those wedges.
+  `geometry::rect_in_frame` rotates the rectangle's corners back by the straighten
+  angle — the same inverse map the rotation itself uses, so the UI and the pixels
+  agree by construction — and asks whether they land inside the pre-rotation frame.
+  `fit_crop_in_frame` shrinks an out-of-bounds rectangle toward the canvas centre
+  until it does, and `fill_frame` grows one the other way to the largest that still
+  fits; both move along a path that holds the width:height ratio, so an aspect lock
+  survives either. With the toggle off the rectangle is bounded only by the canvas.
+  The overlay draws the boundary itself, so the frame visibly stops at something.
 - **Interactivity**: the UI thread never touches pixels. A worker thread owns the
   decoded image plus a preview-sized copy; slider changes send parameters over a
   channel, stale requests are dropped, and only the newest state is rendered
@@ -209,5 +261,14 @@ delete. Deleting a sidecar simply reverts the photo to its unedited state. Unkno
 or missing fields are tolerated, so sidecars stay compatible across app versions.
 
 Where a field's shape has genuinely changed, the old one is still read and migrated
-on load: masks used to hold a single `kind` before they could compose several
-shapes, and such a mask now loads with that shape as its first component.
+on load:
+
+- Masks used to hold a single `kind` before they could compose several shapes, and
+  such a mask now loads with that shape as its first component.
+- `crop` used to be a fraction of the *un-grown* straighten canvas, back when
+  straightening rotated inside the source size. It is now a fraction of the rotated
+  bounding box, which is larger and shares the same centre. Sidecars written before
+  the change have no `crop_space` key, read as `0`, and are re-normalized once when
+  the photo's dimensions arrive — same pixels, new denominator. Only photos that had
+  both a straighten angle and a crop are touched, and only once; the rewritten
+  sidecar carries `"crop_space": 1`.

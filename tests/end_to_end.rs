@@ -69,9 +69,14 @@ fn import_edit_export_round_trip() {
     )
     .unwrap();
     let exported = image::open(&out_path).unwrap();
-    // rotate90 swaps dims (200x120 -> 120x200), crop takes 80%: 96x160.
-    assert_eq!(exported.width(), 96);
-    assert_eq!(exported.height(), 160);
+    // rotate90 swaps dims (200x120 -> 120x200); the 2° straighten grows the
+    // canvas to the rotated bounding box (127x204) so no corner is clipped;
+    // the crop then takes 80% of that.
+    assert_eq!((exported.width(), exported.height()), (102, 163));
+    assert_eq!(
+        (exported.width() as usize, exported.height() as usize),
+        expected_dims
+    );
 
     // The edit must actually change pixels vs. an identity export.
     let identity_out = dir.join("identity.jpg");
@@ -137,9 +142,7 @@ fn batch_export_whole_folder() {
 
 #[test]
 fn advanced_edits_export_end_to_end() {
-    use photo_editor::engine::params::{
-        Dab, LocalAdjust, Mask, MaskComponent, MaskKind, MaskOp,
-    };
+    use photo_editor::engine::params::{Dab, LocalAdjust, Mask, MaskComponent, MaskKind, MaskOp};
 
     let dir = std::env::temp_dir().join("photo-editor-e2e-advanced");
     std::fs::create_dir_all(&dir).unwrap();

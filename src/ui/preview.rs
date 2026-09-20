@@ -6,11 +6,15 @@
 //!   resolution, we ask the app to render the visible area from the
 //!   full-res source and draw that texture over the soft preview.
 //! - Crop overlay: while the crop tool is open, an interactive rect with
-//!   corner/edge handles edits `EditParams::crop` in place.
+//!   corner/edge handles edits `EditParams::crop` in place. The view still
+//!   zooms and pans underneath it — a drag that doesn't grab the frame, or
+//!   any middle-drag, pans instead.
 //! - Mask overlay: while a mask is open, every shape composed into it is
 //!   outlined and the selected one takes drags (or brush strokes).
 
+use crate::engine::ops::geometry;
 use crate::engine::params::{Dab, MaskComponent, MaskKind, MaskOp};
+use crate::ui::crop::MIN_CROP;
 
 pub struct PreviewState {
     pub fit: bool,
@@ -66,8 +70,23 @@ pub struct CropOverlay<'a> {
     pub crop: &'a mut [f32; 4],
     /// Locked pixel aspect ratio (w/h), if any.
     pub aspect: Option<f32>,
-    /// Oriented, uncropped full-image dimensions.
+    /// Straightened, uncropped canvas dimensions — what `crop` is a fraction
+    /// of, and what the aspect lock's pixel ratio is measured against.
     pub dims: (usize, usize),
+    /// Straighten angle in degrees. The canvas's real pixels are the source
+    /// frame rotated by this much; the rest is the black corner wedges.
+    pub angle: f32,
+    /// The frame the angle rotates — dimensions before straightening.
+    pub source_dims: (usize, usize),
+    /// Keep the crop rectangle inside those real pixels.
+    pub constrain: bool,
+}
+
+impl CropOverlay<'_> {
+    /// The straightened frame to hold the crop inside, if we're holding it.
+    fn frame(&self) -> Option<(f32, (usize, usize))> {
+        self.constrain.then_some((self.angle, self.source_dims))
+    }
 }
 
 /// The rendered preview's pixels, so the brush can read the color it is
@@ -117,8 +136,6 @@ pub struct PreviewOutput {
     pub eyedrop_point: Option<[f32; 2]>,
 }
 
-const MIN_CROP: f32 = 0.03;
-
 pub fn show(
     ui: &mut egui::Ui,
     state: &mut PreviewState,
@@ -158,26 +175,38 @@ pub fn show(
 
     let cropping = crop.is_some();
     let masking = mask_edit.is_some();
-    // Both overlay modes fit the whole image and disable pan/zoom-drag.
-    let overlay_mode = cropping || masking;
+    // Mask editing keeps the whole frame on screen so the shapes stay put;
+    // cropping navigates freely, like the normal view.
+    let view_locked = masking;
     let img_size = tex.size_vec2();
     let margin = if cropping { 24.0 } else { 0.0 };
     let fit_scale = ((rect.width() - margin) / img_size.x)
         .min((rect.height() - margin) / img_size.y)
         .min(4.0);
-    let mut scale = if state.fit || overlay_mode {
+    let mut scale = if state.fit || view_locked {
         fit_scale
     } else {
         state.zoom
     };
 
-    if !overlay_mode {
+    if view_locked {
+        state.crop_drag = None;
+        state.offset = egui::Vec2::ZERO;
+        scale = fit_scale;
+    } else {
         // Zoom: mouse wheel / pinch / ctrl+wheel, anchored at the cursor.
         if resp.hovered() {
             let (scroll, pinch) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
             let factor = pinch * (1.0 + scroll * 0.0015);
             if (factor - 1.0).abs() > 1e-4 {
-                let new_scale = (scale * factor).clamp(0.02_f32.min(fit_scale), 8.0);
+                // While cropping, stop well short of losing the photo in the
+                // panel — there's nothing useful past a quarter of fit.
+                let floor = if cropping {
+                    fit_scale * 0.25
+                } else {
+                    0.02_f32.min(fit_scale)
+                };
+                let new_scale = (scale * factor).clamp(floor, 8.0);
                 if let Some(ptr) = resp.hover_pos() {
                     let center = rect.center() + state.offset;
                     let v = ptr - center;
@@ -189,31 +218,56 @@ pub fn show(
             }
         }
 
-        if resp.dragged() && !state.fit {
-            state.offset += resp.drag_delta();
+        if state.fit {
+            state.offset = egui::Vec2::ZERO;
+            scale = fit_scale;
+            state.zoom = fit_scale;
         }
 
-        if resp.double_clicked() {
-            if state.fit {
+        // Where the image sits before this frame's pan. A drag is only ever
+        // classified on the frame it starts, when its delta is still zero,
+        // so this is the rect to hit-test the crop handles against.
+        let pre = egui::Rect::from_center_size(rect.center() + state.offset, img_size * scale);
+
+        // A left-drag that grabs the crop frame edits the crop; anything
+        // else — including a middle-drag from inside it — pans the view.
+        match crop.as_ref() {
+            Some(c) if resp.drag_started_by(egui::PointerButton::Primary) => {
+                let frame = crop_screen_rect(pre, c.crop);
+                state.crop_drag = resp
+                    .interact_pointer_pos()
+                    .and_then(|p| hit_handle(&frame, p));
+            }
+            None => state.crop_drag = None,
+            _ => {}
+        }
+
+        if resp.dragged() && state.crop_drag.is_none() && (cropping || !state.fit) {
+            state.offset += resp.drag_delta();
+            state.fit = false;
+        }
+
+        // Double-click on empty canvas: fit <-> 100% normally, and back to
+        // fit while cropping (where jumping to 100% would lose the frame).
+        let on_crop_frame = crop.as_ref().is_some_and(|c| {
+            resp.hover_pos()
+                .is_some_and(|p| hit_handle(&crop_screen_rect(pre, c.crop), p).is_some())
+        });
+        if resp.double_clicked() && !on_crop_frame {
+            if cropping || !state.fit {
+                state.fit = true;
+                state.offset = egui::Vec2::ZERO;
+                scale = fit_scale;
+                state.zoom = fit_scale;
+            } else {
                 state.fit = false;
                 state.zoom = 1.0; // 100% of the *preview* texture
                 if let Some(ptr) = resp.hover_pos() {
                     let frac = (ptr - (rect.center() + state.offset)) / fit_scale;
                     state.offset = -frac;
                 }
-            } else {
-                state.fit = true;
             }
         }
-
-        if state.fit {
-            state.offset = egui::Vec2::ZERO;
-            scale = fit_scale;
-            state.zoom = fit_scale;
-        }
-    } else {
-        state.offset = egui::Vec2::ZERO;
-        scale = fit_scale;
     }
 
     let size = img_size * scale;
@@ -231,8 +285,10 @@ pub fn show(
     }
 
     // --- Region of interest: sharpen what's visible when zoomed in ---
+    // Not while cropping: the worker always bakes the crop into a region
+    // render, so the sharpened tile would not match what's on screen.
     let displayed_soft = img_rect.width() > img_size.x * 1.05;
-    if !overlay_mode && displayed_soft {
+    if !cropping && !masking && displayed_soft {
         // Draw the last rendered region (may lag slightly behind panning).
         if let Some((rtex, rrect)) = region {
             let sub = egui::Rect::from_min_size(
@@ -273,14 +329,11 @@ pub fn show(
 
     // --- Editing overlays ---
     if let Some(c) = crop {
-        out.crop_changed = crop_overlay(ui, state, &painter, &resp, img_rect, c);
-    } else {
-        state.crop_drag = None;
-        if let Some(m) = mask_edit {
-            // With the eyedropper armed the mask is drawn but not editable,
-            // so a click samples a color instead of dragging or painting.
-            out.mask_changed = mask_overlay(ui, &painter, &resp, img_rect, m, !eyedropper);
-        }
+        out.crop_changed = crop_overlay(ui, state, &painter, &resp, img_rect, rect, c);
+    } else if let Some(m) = mask_edit {
+        // With the eyedropper armed the mask is drawn but not editable,
+        // so a click samples a color instead of dragging or painting.
+        out.mask_changed = mask_overlay(ui, &painter, &resp, img_rect, m, !eyedropper);
     }
 
     // --- Eyedropper: a click samples a normalized image point ---
@@ -298,7 +351,7 @@ pub fn show(
         }
     }
 
-    if !overlay_mode {
+    if !masking {
         // Zoom readout, bottom-left.
         let label = if state.fit {
             "Fit".to_string()
@@ -325,23 +378,33 @@ pub fn show(
     out
 }
 
+/// Where a normalized crop rect lands on screen.
+fn crop_screen_rect(img_rect: egui::Rect, c: &[f32; 4]) -> egui::Rect {
+    egui::Rect::from_min_size(
+        img_rect.min + egui::vec2(c[0] * img_rect.width(), c[1] * img_rect.height()),
+        egui::vec2(c[2] * img_rect.width(), c[3] * img_rect.height()),
+    )
+}
+
 /// Draw and edit the crop rectangle. Returns true if the crop changed.
+/// The grab test for a starting drag lives in `show`, which has to know
+/// whether to pan instead; here we only carry an in-flight drag.
 fn crop_overlay(
     ui: &egui::Ui,
     state: &mut PreviewState,
     painter: &egui::Painter,
     resp: &egui::Response,
     img_rect: egui::Rect,
+    viewport: egui::Rect,
     c: CropOverlay,
 ) -> bool {
-    let crop_rect = egui::Rect::from_min_size(
-        img_rect.min + egui::vec2(c.crop[0] * img_rect.width(), c.crop[1] * img_rect.height()),
-        egui::vec2(c.crop[2] * img_rect.width(), c.crop[3] * img_rect.height()),
-    );
+    let crop_rect = crop_screen_rect(img_rect, c.crop);
 
-    // Darken everything outside the crop.
-    let shade = egui::Color32::from_black_alpha(140);
-    let full = img_rect;
+    // Darken everything outside the crop — across the whole viewport, not
+    // just the photo, so the frame reads clearly and the dead space around
+    // the canvas recedes instead of competing with the black wedges.
+    let shade = egui::Color32::from_black_alpha(150);
+    let full = viewport;
     painter.rect_filled(
         egui::Rect::from_min_max(full.min, egui::pos2(full.max.x, crop_rect.min.y)),
         0.0,
@@ -368,6 +431,33 @@ fn crop_overlay(
         0.0,
         shade,
     );
+
+    // The canvas edge, so the photo's extent is distinguishable from the
+    // empty viewport — both are near-black once straightening adds wedges.
+    painter.rect_stroke(
+        img_rect,
+        0.0,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+        egui::StrokeKind::Middle,
+    );
+
+    // The boundary the constraint holds the frame inside: the straightened
+    // photo's real pixels. Without it the frame just refuses to move for no
+    // visible reason. Only worth drawing when there is a wedge to explain.
+    if c.angle != 0.0 {
+        let corners = geometry::frame_corners(c.angle, c.source_dims);
+        let pts: Vec<egui::Pos2> = corners
+            .iter()
+            .chain(std::iter::once(&corners[0]))
+            .map(|n| norm_to_screen(img_rect, *n))
+            .collect();
+        let edge = if c.constrain {
+            egui::Color32::from_rgba_unmultiplied(255, 200, 120, 130)
+        } else {
+            egui::Color32::from_white_alpha(50)
+        };
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, edge)));
+    }
 
     // Border, rule-of-thirds grid, and handles.
     let stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(230));
@@ -399,26 +489,23 @@ fn crop_overlay(
         );
     }
 
-    // Cursor feedback.
+    // Cursor feedback. Off the frame entirely, a drag pans the view.
     if let Some(ptr) = resp.hover_pos() {
-        if let Some(h) = state.crop_drag.or_else(|| hit_handle(&crop_rect, ptr)) {
-            ui.ctx().set_cursor_icon(match h {
+        match state.crop_drag.or_else(|| hit_handle(&crop_rect, ptr)) {
+            Some(h) => ui.ctx().set_cursor_icon(match h {
                 Handle::N | Handle::S => egui::CursorIcon::ResizeVertical,
                 Handle::E | Handle::W => egui::CursorIcon::ResizeHorizontal,
                 Handle::NE | Handle::SW => egui::CursorIcon::ResizeNeSw,
                 Handle::NW | Handle::SE => egui::CursorIcon::ResizeNwSe,
                 Handle::Move => egui::CursorIcon::Grab,
-            });
+            }),
+            None => ui.ctx().set_cursor_icon(egui::CursorIcon::AllScroll),
         }
     }
 
     // Interaction.
+    let frame = c.frame();
     let mut changed = false;
-    if resp.drag_started() {
-        state.crop_drag = resp
-            .interact_pointer_pos()
-            .and_then(|p| hit_handle(&crop_rect, p));
-    }
     if resp.dragged() {
         if let Some(handle) = state.crop_drag {
             let d = resp.drag_delta();
@@ -428,7 +515,7 @@ fn crop_overlay(
                 let aspect_norm = c
                     .aspect
                     .map(|a| a * c.dims.1.max(1) as f32 / c.dims.0.max(1) as f32);
-                apply_crop_drag(c.crop, handle, dn, aspect_norm);
+                apply_crop_drag(c.crop, handle, dn, aspect_norm, frame);
                 changed = true;
             }
         }
@@ -490,8 +577,82 @@ fn hit_handle(crop_rect: &egui::Rect, p: egui::Pos2) -> Option<Handle> {
 
 /// Mutate the normalized crop rect for a drag of `dn` on `handle`,
 /// optionally keeping a locked (normalized) aspect ratio.
-fn apply_crop_drag(crop: &mut [f32; 4], handle: Handle, dn: egui::Vec2, aspect: Option<f32>) {
-    let [x, y, w, h] = *crop;
+///
+/// `frame` is the straightened photo (angle, oriented dims) the rect must
+/// stay inside; `None` lets it roam the whole canvas.
+fn apply_crop_drag(
+    crop: &mut [f32; 4],
+    handle: Handle,
+    dn: egui::Vec2,
+    aspect: Option<f32>,
+    frame: Option<(f32, (usize, usize))>,
+) {
+    let prev = *crop;
+    let cand = crop_dragged(prev, handle, dn, aspect);
+    *crop = match frame {
+        None => cand,
+        Some((deg, dims)) => hold_in_frame(prev, cand, handle, dn, aspect, deg, dims),
+    };
+}
+
+/// Keep a dragged rect inside the straightened photo.
+fn hold_in_frame(
+    prev: [f32; 4],
+    cand: [f32; 4],
+    handle: Handle,
+    dn: egui::Vec2,
+    aspect: Option<f32>,
+    deg: f32,
+    dims: (usize, usize),
+) -> [f32; 4] {
+    if geometry::rect_in_frame(cand, deg, dims) {
+        return cand;
+    }
+    if !geometry::rect_in_frame(prev, deg, dims) {
+        // Already out of bounds — placed while unconstrained, or left behind
+        // by an angle change. Repair it rather than refuse the drag.
+        let mut fixed = cand;
+        geometry::fit_crop_in_frame(&mut fixed, deg, dims);
+        return fixed;
+    }
+    // Moving the whole frame: try each axis alone so it slides along a
+    // diagonal boundary instead of sticking to it.
+    if handle == Handle::Move {
+        for d in [egui::vec2(dn.x, 0.0), egui::vec2(0.0, dn.y)] {
+            if d == egui::Vec2::ZERO {
+                continue;
+            }
+            let axis = crop_dragged(prev, handle, d, aspect);
+            if geometry::rect_in_frame(axis, deg, dims) {
+                return axis;
+            }
+        }
+    }
+    // Otherwise stop at the boundary: the furthest point along the drag
+    // that still fits. Both ends share any locked ratio, so this does too.
+    let lerp = |t: f32| {
+        let mut r = [0.0f32; 4];
+        for i in 0..4 {
+            r[i] = prev[i] + (cand[i] - prev[i]) * t;
+        }
+        r
+    };
+    let (mut lo, mut hi) = (0.0f32, 1.0f32); // `lo` fits, `hi` doesn't.
+    for _ in 0..16 {
+        let mid = (lo + hi) * 0.5;
+        if geometry::rect_in_frame(lerp(mid), deg, dims) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lerp(lo)
+}
+
+/// The rect a drag asks for, before any frame constraint: resize or move,
+/// honoring a locked aspect, clamped to the canvas.
+fn crop_dragged(crop: [f32; 4], handle: Handle, dn: egui::Vec2, aspect: Option<f32>) -> [f32; 4] {
+    let [x, y, w, h] = crop;
     let right = x + w;
     let bottom = y + h;
     let (mut nx, mut ny, mut nw, mut nh) = (x, y, w, h);
@@ -553,12 +714,20 @@ fn apply_crop_drag(crop: &mut [f32; 4], handle: Handle, dn: egui::Vec2, aspect: 
         }
     }
 
-    // Clamp inside the frame.
-    nw = nw.min(1.0);
-    nh = nh.min(1.0);
+    // Clamp inside the canvas — always the outer bound, constrained or not.
+    // With a locked aspect both sides shrink together, so hitting an edge
+    // doesn't quietly clip one of them and break the ratio.
+    if aspect.is_some() {
+        let squeeze = (1.0 / nw).min(1.0 / nh).min(1.0);
+        nw *= squeeze;
+        nh *= squeeze;
+    } else {
+        nw = nw.min(1.0);
+        nh = nh.min(1.0);
+    }
     nx = nx.clamp(0.0, 1.0 - nw);
     ny = ny.clamp(0.0, 1.0 - nh);
-    *crop = [nx, ny, nw, nh];
+    [nx, ny, nw, nh]
 }
 
 /// Screen position of a normalized image point.
@@ -605,10 +774,7 @@ fn draw_component_outline(
         }
         MaskKind::Linear { p0, p1 } => {
             painter.line_segment(
-                [
-                    norm_to_screen(img_rect, *p0),
-                    norm_to_screen(img_rect, *p1),
-                ],
+                [norm_to_screen(img_rect, *p0), norm_to_screen(img_rect, *p1)],
                 stroke,
             );
         }
@@ -840,10 +1006,12 @@ fn draw_ellipse(
 mod tests {
     use super::*;
 
+    const DIMS: (usize, usize) = (4000, 3000);
+
     #[test]
     fn drag_east_grows_width() {
         let mut c = [0.25, 0.25, 0.5, 0.5];
-        apply_crop_drag(&mut c, Handle::E, egui::vec2(0.1, 0.0), None);
+        apply_crop_drag(&mut c, Handle::E, egui::vec2(0.1, 0.0), None, None);
         assert!((c[2] - 0.6).abs() < 1e-5);
         assert_eq!(c[0], 0.25);
     }
@@ -851,7 +1019,7 @@ mod tests {
     #[test]
     fn drag_nw_keeps_bottom_right_anchored() {
         let mut c = [0.2, 0.2, 0.6, 0.6];
-        apply_crop_drag(&mut c, Handle::NW, egui::vec2(0.1, 0.1), None);
+        apply_crop_drag(&mut c, Handle::NW, egui::vec2(0.1, 0.1), None, None);
         assert!((c[0] - 0.3).abs() < 1e-5);
         assert!((c[0] + c[2] - 0.8).abs() < 1e-5); // right edge unchanged
         assert!((c[1] + c[3] - 0.8).abs() < 1e-5); // bottom edge unchanged
@@ -860,7 +1028,7 @@ mod tests {
     #[test]
     fn aspect_lock_follows_width() {
         let mut c = [0.0, 0.0, 0.5, 0.5];
-        apply_crop_drag(&mut c, Handle::E, egui::vec2(0.2, 0.0), Some(1.0));
+        apply_crop_drag(&mut c, Handle::E, egui::vec2(0.2, 0.0), Some(1.0), None);
         assert!((c[2] - 0.7).abs() < 1e-5);
         assert!((c[3] - 0.7).abs() < 1e-5); // height followed (norm aspect 1)
     }
@@ -868,8 +1036,60 @@ mod tests {
     #[test]
     fn move_clamps_to_frame() {
         let mut c = [0.5, 0.5, 0.4, 0.4];
-        apply_crop_drag(&mut c, Handle::Move, egui::vec2(0.5, 0.5), None);
+        apply_crop_drag(&mut c, Handle::Move, egui::vec2(0.5, 0.5), None, None);
         assert!((c[0] - 0.6).abs() < 1e-5);
         assert!((c[1] - 0.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn unconstrained_drag_still_reaches_the_black_corners() {
+        // With no frame the rect may sit over pixels the straighten left black.
+        let mut c = [0.3, 0.3, 0.4, 0.4];
+        apply_crop_drag(&mut c, Handle::NW, egui::vec2(-1.0, -1.0), None, None);
+        assert_eq!([c[0], c[1]], [0.0, 0.0]);
+        assert!(!geometry::rect_in_frame(c, 25.0, DIMS));
+    }
+
+    #[test]
+    fn constrained_drag_stops_at_the_frame() {
+        let frame = Some((25.0, DIMS));
+        let mut c = [0.3, 0.3, 0.4, 0.4];
+        assert!(geometry::rect_in_frame(c, 25.0, DIMS));
+        // Yank the corner well past the canvas edge.
+        apply_crop_drag(&mut c, Handle::NW, egui::vec2(-1.0, -1.0), None, frame);
+        assert!(geometry::rect_in_frame(c, 25.0, DIMS));
+        assert!(c[0] > 0.0 && c[1] > 0.0); // stopped short of the corner
+    }
+
+    #[test]
+    fn constrained_move_slides_along_the_boundary() {
+        let frame = Some((25.0, DIMS));
+        let mut c = [0.4, 0.4, 0.2, 0.2];
+        // Up-and-left: the vertical part is blocked first, the horizontal
+        // part should still go through rather than freezing the frame.
+        apply_crop_drag(&mut c, Handle::Move, egui::vec2(-0.3, -0.3), None, frame);
+        assert!(geometry::rect_in_frame(c, 25.0, DIMS));
+        assert!(c[0] < 0.4);
+    }
+
+    #[test]
+    fn constrained_drag_repairs_an_out_of_bounds_rect() {
+        let frame = Some((25.0, DIMS));
+        // Placed while unconstrained, then the toggle came back on.
+        let mut c = [0.0, 0.0, 1.0, 1.0];
+        apply_crop_drag(&mut c, Handle::Move, egui::vec2(0.01, 0.0), None, frame);
+        assert!(geometry::rect_in_frame(c, 25.0, DIMS));
+    }
+
+    #[test]
+    fn constrained_drag_holds_a_locked_aspect() {
+        let frame = Some((-28.0, DIMS));
+        let mut c = [0.4, 0.3, 0.12, 0.16];
+        let want = c[2] / c[3];
+        for _ in 0..40 {
+            apply_crop_drag(&mut c, Handle::SE, egui::vec2(0.05, 0.0), Some(want), frame);
+        }
+        assert!(geometry::rect_in_frame(c, -28.0, DIMS));
+        assert!((c[2] / c[3] - want).abs() < 1e-3);
     }
 }

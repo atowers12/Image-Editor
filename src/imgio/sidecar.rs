@@ -63,4 +63,30 @@ mod tests {
         assert!(load(&img).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
+
+    #[test]
+    fn a_sidecar_without_crop_space_reads_as_legacy() {
+        let dir = std::env::temp_dir().join("photo-editor-test-sidecar-legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("old.jpg");
+
+        // Written before straightening grew the canvas: no `crop_space` key.
+        // It must read as 0 so the app knows to re-normalize the crop once.
+        std::fs::write(
+            sidecar_path(&img),
+            r#"{"exposure":0.5,"angle":3.0,"crop":[0.1,0.1,0.8,0.8]}"#,
+        )
+        .unwrap();
+        let loaded = load(&img).unwrap();
+        assert_eq!(loaded.crop_space, 0);
+        assert_eq!(loaded.crop, [0.1, 0.1, 0.8, 0.8]);
+        assert_eq!(loaded.angle, 3.0);
+
+        // Anything this app writes is stamped current.
+        assert_eq!(
+            EditParams::default().crop_space,
+            crate::engine::params::CROP_SPACE_GROWN
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

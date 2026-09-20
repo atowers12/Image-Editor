@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::engine::histogram::Histogram;
 use crate::engine::ops;
-use crate::engine::params::{CurveChannel, EditParams, Flag};
+use crate::engine::params::{self, CurveChannel, EditParams, Flag};
 use crate::engine::tuning::Tuning;
 use crate::engine::worker::{self, Cmd, Reply, Worker};
 use crate::imgio::export::{BatchJob, BatchMsg};
@@ -105,6 +105,9 @@ pub struct App {
     before_view: bool,
     pick: Pick,
     aspect: AspectLock,
+    /// Keep the crop rectangle inside the photo's real pixels. A tool
+    /// preference, not part of the edit, so it sticks across photos.
+    constrain_crop: bool,
     active_band: usize,
     curve_channel: CurveChannel,
     selected_mask: Option<usize>,
@@ -171,6 +174,7 @@ impl App {
             before_view: false,
             pick: Pick::None,
             aspect: AspectLock::Free,
+            constrain_crop: true,
             active_band: 0,
             curve_channel: CurveChannel::Master,
             selected_mask: None,
@@ -231,6 +235,7 @@ impl App {
                     if Some(&path) == self.current_path() {
                         self.full_size = Some((full_width, full_height));
                         self.exif = exif;
+                        self.migrate_crop_space(full_width, full_height);
                     }
                 }
                 Reply::Neutral { temp, tint } => {
@@ -449,6 +454,44 @@ impl App {
             self.before_view = false;
             self.request_render();
         }
+    }
+
+    /// Bring a sidecar written before straightening grew the canvas up to
+    /// date. Straightening used to rotate inside the source size, so a saved
+    /// crop was a fraction of that; it is now a fraction of the rotated
+    /// bounding box. Same pixels, new denominator — remap once, on load,
+    /// when the photo's true dimensions first arrive.
+    fn migrate_crop_space(&mut self, full_width: usize, full_height: usize) {
+        if self.params.crop_space >= params::CROP_SPACE_GROWN {
+            return;
+        }
+        self.params.crop_space = params::CROP_SPACE_GROWN;
+        let remap = self.params.angle != 0.0 && self.params.has_crop();
+        if remap {
+            let src = ops::geometry::source_dims(full_width, full_height, &self.params);
+            self.params.crop = ops::geometry::migrate_crop_to_grown_canvas(
+                self.params.crop,
+                self.params.angle,
+                src,
+            );
+        }
+        // Sync either way so the version stamp alone never registers as an
+        // edit — that would push an undo step and rewrite every old sidecar
+        // just for opening the photo. Only a real remap is worth persisting.
+        self.committed = self.params.clone();
+        if remap {
+            self.sidecar_dirty = true;
+            self.request_render();
+        }
+    }
+
+    /// The frame the straighten angle rotates — full dimensions after the 90°
+    /// orientation step. This is what the crop constraint tests against.
+    /// `None` until the photo's real dimensions arrive from the worker, so
+    /// the constraint is never computed against a guessed frame.
+    fn crop_source_dims(&self) -> Option<(usize, usize)> {
+        self.full_size
+            .map(|(w, h)| ops::geometry::source_dims(w, h, &self.params))
     }
 
     fn crop_rect_edited(&mut self) {
@@ -797,6 +840,13 @@ impl App {
                 self.selected_mask = (!self.params.masks.is_empty()).then_some(0);
                 self.selected_component = 0;
             }
+            // Open the crop tool on the whole photo — arriving zoomed in
+            // would leave the frame's handles off screen. It pans and zooms
+            // freely from there.
+            if self.mode == Mode::Crop {
+                self.preview_state.fit = true;
+                self.preview_state.offset = egui::Vec2::ZERO;
+            }
             self.request_render();
         }
     }
@@ -999,7 +1049,15 @@ impl App {
         match self.mode {
             Mode::Crop => {
                 let dims = self.oriented_dims.unwrap_or((1, 1));
-                match crop::panel(ui, &mut self.params, &mut self.aspect, dims) {
+                let source_dims = self.crop_source_dims();
+                match crop::panel(
+                    ui,
+                    &mut self.params,
+                    &mut self.aspect,
+                    &mut self.constrain_crop,
+                    dims,
+                    source_dims,
+                ) {
                     CropAction::Changed => self.params_edited(),
                     CropAction::Done => {
                         self.mode = Mode::Adjust;
@@ -1066,6 +1124,7 @@ impl App {
             _ => None,
         };
         let dims = self.oriented_dims.unwrap_or((1, 1));
+        let source_dims = self.crop_source_dims();
 
         // Build at most one editing overlay, borrowing the relevant params.
         let crop_overlay = if self.mode == Mode::Crop {
@@ -1073,6 +1132,10 @@ impl App {
                 crop: &mut self.params.crop,
                 aspect: self.aspect.ratio(dims),
                 dims,
+                angle: self.params.angle,
+                source_dims: source_dims.unwrap_or(dims),
+                // Never constrain against a frame we had to guess.
+                constrain: self.constrain_crop && source_dims.is_some(),
             })
         } else {
             None

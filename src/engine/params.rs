@@ -11,6 +11,11 @@ pub const HSL_BAND_HUES: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 280.0
 /// Identity crop rectangle (x, y, w, h — normalized to the image).
 pub const CROP_FULL: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
 
+/// Current value of `EditParams::crop_space`: the crop is a fraction of the
+/// straightened canvas (the rotated bounding box). 0 means a sidecar written
+/// when straightening rotated inside the source size instead.
+pub const CROP_SPACE_GROWN: u8 = 1;
+
 /// Per-band hue/saturation/luminance adjustments, each -100..=100.
 #[derive(Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -434,7 +439,12 @@ pub struct EditParams {
     pub flip_h: bool,
     pub flip_v: bool,
     pub angle: f32,     // straighten, degrees, -45..=45
-    pub crop: [f32; 4], // x, y, w, h normalized to the oriented image
+    pub crop: [f32; 4], // x, y, w, h normalized to the straightened canvas
+    /// Which canvas `crop` is normalized against. Sidecars written before
+    /// straightening grew the canvas to the rotated bounding box lack the
+    /// field and read as 0; the app re-normalizes those once, on load.
+    #[serde(default)]
+    pub crop_space: u8,
     // Metadata (not a pixel edit, but persisted alongside)
     pub rating: u8, // 0..=5
     pub flag: Flag,
@@ -474,6 +484,7 @@ impl Default for EditParams {
             flip_v: false,
             angle: 0.0,
             crop: CROP_FULL,
+            crop_space: CROP_SPACE_GROWN,
             rating: 0,
             flag: Flag::None,
         }
@@ -548,6 +559,7 @@ impl EditParams {
             flip_v: self.flip_v,
             angle: self.angle,
             crop: self.crop,
+            crop_space: self.crop_space,
             rating: self.rating,
             flag: self.flag,
             ..EditParams::default()
@@ -571,6 +583,7 @@ impl EditParams {
         self.flip_v = false;
         self.angle = 0.0;
         self.crop = CROP_FULL;
+        self.crop_space = CROP_SPACE_GROWN;
     }
 }
 
