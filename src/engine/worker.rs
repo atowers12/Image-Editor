@@ -152,6 +152,10 @@ impl WorkerState {
                     Cmd::RenderRegion { .. } => queue
                         .iter()
                         .any(|m| matches!(m, Cmd::RenderRegion { .. } | Cmd::Load { .. })),
+                    // Arrowing through a folder queues one load per photo
+                    // passed; only the one landed on is worth decoding. The
+                    // app ignores replies for photos it has moved off anyway.
+                    Cmd::Load { .. } => queue.iter().any(|m| matches!(m, Cmd::Load { .. })),
                     _ => false,
                 };
                 if superseded {

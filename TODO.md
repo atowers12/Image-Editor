@@ -16,7 +16,7 @@ only untouched item.**
 | 5 | [Local adjustments](#5-local-adjustments) | 100% | ✅ Shipped |
 | 6 | [Sharpening & noise reduction](#6-sharpening--noise-reduction) | 85% | ✅ Shipped, refinements open |
 | 7 | [White-balance eyedropper](#7-white-balance-eyedropper) | 100% | ✅ Shipped |
-| 8 | [EXIF panel + ratings/flags](#8-exif-panel--star-ratingsflags) | 85% | ✅ Shipped, culling workflow open |
+| 8 | [EXIF panel + ratings/flags](#8-exif-panel--star-ratingsflags) | 95% | ✅ Shipped, filmstrip filtering open |
 | 9 | [Undo/redo history](#9-undoredo-history) | 90% | ✅ Shipped, session-only |
 | 10 | [GPU pipeline (wgpu)](#10-gpu-pipeline-wgpu) | 0% | ⬜ Not started |
 
@@ -155,20 +155,28 @@ Nothing outstanding.
 
 ## 8. EXIF panel + star ratings/flags
 
-**85% — the display is done; the culling *workflow* is thin.**
+**95% — the display and the culling loop are done; filtering is not.**
 
 EXIF is read best-effort with kamadak-exif in
 [imgio/metadata.rs](src/imgio/metadata.rs) — camera, lens, focal length,
 aperture, shutter, ISO, dimensions, date — and shown read-only in
 [ui/info.rs](src/ui/info.rs), skipping fields that are missing. Ratings (0–5)
-and pick/reject flags are bound to `0`–`5`, `P`, `X`, persisted in the sidecar,
-cached per file in `meta_cache`, and drawn as badges in the filmstrip.
+and pick/reject flags are persisted in the sidecar, cached per file in
+`meta_cache`, and drawn as badges in the filmstrip.
+
+Culling follows Lightroom's keys: arrows move through the folder, `0`–`5` rate,
+`[` / `]` nudge the rating, `P` / `X` / `U` flag, and holding shift applies the
+rating or flag *and* advances — latched by an auto-advance toggle for a whole
+pass. A floating cull bar over the photo carries the same controls. Arrowing
+scrolls the filmstrip to follow the selection, a held arrow is paced so a sweep
+doesn't queue a decode per file, and the worker now drops superseded
+`Cmd::Load`s for the same reason.
 
 Outstanding:
 
 - [ ] **Filter the filmstrip by rating/flag** ("show 3★ and up", "hide
-      rejects"). The badges exist but you still scroll past everything — this is
-      what actually makes culling fast.
+      rejects"). The badges and the keys exist, but you still scroll past
+      everything — this is the last piece that would make a cull pass fast.
 - [ ] Sort by rating or capture date.
 - [ ] Colour labels.
 - [ ] A "delete/move rejects" action.
@@ -218,6 +226,46 @@ Sketch, if it's ever picked up:
 
 ---
 
+## Shipped outside the original list
+
+### Crop & geometry
+
+Crop, 90° rotation, flips and the ±45° straighten slider predate this roadmap.
+Several gaps in the crop tool have since been closed:
+
+- [x] **Straighten no longer clips the photo.** It used to rotate inside the
+      source dimensions, which pushes the rotated rectangle's four corners
+      outside the canvas — so straightening discarded real pixels along every
+      edge *and* added black corners. `rotate_angle` now renders into the
+      rotated bounding box (`straightened_dims`); only the corner wedges are
+      dead. Old sidecars are re-normalized on load, see `crop_space`.
+- [x] The preview zooms and pans while cropping, instead of being pinned to
+      fit-to-window. A left-drag that grabs the crop frame still edits the crop;
+      a drag anywhere else — or a middle-drag from anywhere — pans, the wheel
+      zooms at the cursor, and a double-click off the frame returns to fit.
+- [x] **Constrain to image** (on by default) keeps the crop rectangle on real
+      pixels, so it can't select a region that exports as black wedges.
+      `geometry::rect_in_frame` / `fit_crop_in_frame` answer the question and
+      repair the rectangle; unticking the toggle restores free placement.
+- [x] The constraint boundary is drawn in the overlay, so the frame visibly
+      stops at the photo's edge rather than mysteriously refusing to move, and
+      the canvas gets a border so photo / wedge / empty viewport are
+      distinguishable instead of three shades of near-black.
+- [x] **Fill frame** grows the crop to the largest one of its shape that fits —
+      previously every mechanism only ever shrank it.
+- [x] Aspect-locked drags no longer distort the ratio at a canvas edge: both
+      sides shrink together instead of one being clipped.
+
+Still open:
+
+- [ ] Auto-fill or content-aware fill for the straightened corners, as an
+      alternative to cropping them away.
+- [ ] `fill_frame` bisects for the largest inscribed rectangle. There is a
+      closed form for it; the bisection is imperceptible at 24 iterations, but
+      the exact solution would be nicer.
+
+---
+
 ## Not on the original list
 
 Ideas that surfaced while building the above. None are committed to.
@@ -229,3 +277,11 @@ Ideas that surfaced while building the above. None are committed to.
 - [ ] Split toning / colour grading wheels.
 - [ ] XMP sidecars for interop with Lightroom, instead of the bespoke JSON.
 - [ ] Soft proofing and colour management (ICC output profiles).
+
+
+
+[ ] Add quick export to Photoshop button. It should export the picture (full quality with current settings) to 
+
+[ ] improve the culling features, allow for quick culling.
+
+[] add analytics to see how much time components and scripts take to load

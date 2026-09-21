@@ -30,6 +30,13 @@ const TOAST_TTL: Duration = Duration::from_secs(5);
 const COVERAGE_ALPHA: u8 = 130;
 /// Cap on the undo history depth per photo.
 const MAX_HISTORY: usize = 100;
+/// How far the cull bar floats above the bottom of the preview.
+const CULL_BAR_INSET: f32 = 14.0;
+/// How close the pointer must get to the bottom of the preview for the cull
+/// bar to come up to full opacity.
+const CULL_BAR_REACH: f32 = 130.0;
+/// Minimum gap between photos while an arrow key is held down.
+const NAV_REPEAT_INTERVAL: Duration = Duration::from_millis(110);
 
 struct BatchState {
     job: BatchJob,
@@ -108,6 +115,14 @@ pub struct App {
     /// Keep the crop rectangle inside the photo's real pixels. A tool
     /// preference, not part of the edit, so it sticks across photos.
     constrain_crop: bool,
+    /// Move to the next photo after every rating or flag, not just the ones
+    /// pressed with shift. Lightroom binds this to Caps Lock.
+    auto_advance: bool,
+    /// Set when the keyboard changed the selection, so the filmstrip scrolls
+    /// the newly selected thumbnail into view for one frame.
+    scroll_filmstrip: bool,
+    /// When the selection last moved, to pace a held arrow key.
+    last_nav: Instant,
     active_band: usize,
     curve_channel: CurveChannel,
     selected_mask: Option<usize>,
@@ -175,6 +190,9 @@ impl App {
             pick: Pick::None,
             aspect: AspectLock::Free,
             constrain_crop: true,
+            auto_advance: false,
+            scroll_filmstrip: false,
+            last_nav: Instant::now(),
             active_band: 0,
             curve_channel: CurveChannel::Master,
             selected_mask: None,
@@ -623,36 +641,93 @@ impl App {
         }
     }
 
+    /// Culling keystrokes, following Lightroom's defaults: arrows move through
+    /// the folder, `0`-`5` rate, `[` / `]` nudge the rating, `P` / `X` / `U`
+    /// flag, and holding shift advances to the next photo afterwards.
     fn keyboard(&mut self, ctx: &egui::Context) {
         if ctx.wants_keyboard_input() {
             return; // don't steal keys while typing in a text field
         }
-        let (undo, redo, digits, pick, reject) = ctx.input(|i| {
-            let undo = i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z);
-            let redo = i.modifiers.command
-                && (i.key_pressed(egui::Key::Y)
-                    || (i.modifiers.shift && i.key_pressed(egui::Key::Z)));
-            let mut digit = None;
-            for (k, n) in [
-                (egui::Key::Num0, 0u8),
-                (egui::Key::Num1, 1),
-                (egui::Key::Num2, 2),
-                (egui::Key::Num3, 3),
-                (egui::Key::Num4, 4),
-                (egui::Key::Num5, 5),
-            ] {
-                if i.key_pressed(k) {
-                    digit = Some(n);
+        let mut undo = false;
+        let mut redo = false;
+        let mut nav = 0isize;
+        let mut nav_held = false;
+        let mut rating = None;
+        let mut bump = 0i8;
+        let mut flag = None;
+        let mut advance = false;
+
+        ctx.input(|i| {
+            for ev in &i.events {
+                let egui::Event::Key {
+                    key,
+                    physical_key,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                } = ev
+                else {
+                    continue;
+                };
+                // Match the logical key *or* the physical one. Shift+1 reports
+                // logically as "!", so the digit only survives as the physical
+                // key; letters keep working on non-US layouts via the logical.
+                let is = |want: egui::Key| *key == want || *physical_key == Some(want);
+
+                if modifiers.command {
+                    if is(egui::Key::Z) && !modifiers.shift {
+                        undo = true;
+                    }
+                    if is(egui::Key::Y) || (is(egui::Key::Z) && modifiers.shift) {
+                        redo = true;
+                    }
+                    continue; // Ctrl-combos are never culling keys.
+                }
+
+                // Held arrows should keep moving; a held rating key should not
+                // machine-gun through the folder on auto-advance.
+                if is(egui::Key::ArrowUp) || is(egui::Key::ArrowLeft) {
+                    nav = -1;
+                    nav_held |= *repeat;
+                } else if is(egui::Key::ArrowDown) || is(egui::Key::ArrowRight) {
+                    nav = 1;
+                    nav_held |= *repeat;
+                }
+                if *repeat {
+                    continue;
+                }
+
+                for (k, n) in [
+                    (egui::Key::Num0, 0u8),
+                    (egui::Key::Num1, 1),
+                    (egui::Key::Num2, 2),
+                    (egui::Key::Num3, 3),
+                    (egui::Key::Num4, 4),
+                    (egui::Key::Num5, 5),
+                ] {
+                    if is(k) {
+                        rating = Some(n);
+                        advance |= modifiers.shift;
+                    }
+                }
+                if is(egui::Key::OpenBracket) {
+                    bump = -1;
+                } else if is(egui::Key::CloseBracket) {
+                    bump = 1;
+                }
+                for (k, f) in [
+                    (egui::Key::P, Flag::Pick),
+                    (egui::Key::X, Flag::Reject),
+                    (egui::Key::U, Flag::None),
+                ] {
+                    if is(k) {
+                        flag = Some(f);
+                        advance |= modifiers.shift;
+                    }
                 }
             }
-            (
-                undo,
-                redo,
-                digit,
-                i.key_pressed(egui::Key::P),
-                i.key_pressed(egui::Key::X),
-            )
         });
+
         if self.current_path().is_none() {
             return;
         }
@@ -662,25 +737,62 @@ impl App {
         if redo {
             self.redo();
         }
-        if let Some(n) = digits {
-            self.params.rating = n;
-            self.params_edited();
+        if nav != 0 {
+            // A held arrow walks the folder at a steady pace rather than the
+            // OS repeat rate — every step is a fresh decode, and on RAW files
+            // an unthrottled sweep buries the worker.
+            if !nav_held || self.last_nav.elapsed() >= NAV_REPEAT_INTERVAL {
+                self.last_nav = Instant::now();
+                self.select_relative(nav);
+            }
+            return; // The keys below belong to the photo we just left.
         }
-        if pick {
-            self.params.flag = if self.params.flag == Flag::Pick {
+
+        let mut rated = false;
+        if let Some(n) = rating {
+            self.set_rating(n);
+            rated = true;
+        }
+        if bump != 0 {
+            let next = (self.params.rating as i8 + bump).clamp(0, 5) as u8;
+            self.set_rating(next);
+        }
+        if let Some(f) = flag {
+            // Pick and reject toggle, so the key that set a flag also clears
+            // it; `U` always means "no flag".
+            self.params.flag = if f != Flag::None && self.params.flag == f {
                 Flag::None
             } else {
-                Flag::Pick
+                f
             };
+            self.params_edited();
+            rated = true;
+        }
+        if rated && (advance || self.auto_advance) {
+            self.select_relative(1);
+        }
+    }
+
+    fn set_rating(&mut self, stars: u8) {
+        if self.params.rating != stars {
+            self.params.rating = stars;
             self.params_edited();
         }
-        if reject {
-            self.params.flag = if self.params.flag == Flag::Reject {
-                Flag::None
-            } else {
-                Flag::Reject
-            };
-            self.params_edited();
+    }
+
+    /// Step through the folder for culling. Stops at either end rather than
+    /// wrapping, so holding an arrow doesn't loop back around.
+    fn select_relative(&mut self, delta: isize) {
+        let Some(current) = self.selected else { return };
+        if self.files.is_empty() {
+            return;
+        }
+        let last = self.files.len() as isize - 1;
+        let next = (current as isize + delta).clamp(0, last) as usize;
+        if next != current {
+            self.select_photo(next);
+            // Keep the keyboard-driven selection in view.
+            self.scroll_filmstrip = true;
         }
     }
 
@@ -1123,6 +1235,9 @@ impl App {
             (Some(t), Some(r)) => Some((t, r)),
             _ => None,
         };
+        // Captured before the preview claims the space, so the cull bar can
+        // be placed over the bottom of the photo.
+        let preview_rect = ui.available_rect_before_wrap();
         let dims = self.oriented_dims.unwrap_or((1, 1));
         let source_dims = self.crop_source_dims();
 
@@ -1219,6 +1334,59 @@ impl App {
                 });
             }
         }
+
+        self.cull_bar(ui, preview_rect);
+    }
+
+    /// The floating rating/flag/navigation strip over the bottom of the photo.
+    /// Adjust mode only — in Crop and Mask it would sit on top of the very
+    /// handles you are trying to drag.
+    fn cull_bar(&mut self, ui: &mut egui::Ui, preview_rect: egui::Rect) {
+        if self.mode != Mode::Adjust || self.current_path().is_none() {
+            return;
+        }
+        let anchor = egui::pos2(preview_rect.center().x, preview_rect.max.y - CULL_BAR_INSET);
+        // Fade out while the pointer is up in the photo, so the bar isn't
+        // permanently competing with the image for attention.
+        let near = ui.ctx().pointer_latest_pos().is_some_and(|p| {
+            p.y > preview_rect.max.y - CULL_BAR_REACH && preview_rect.x_range().contains(p.x)
+        });
+        let opacity = if near { 1.0 } else { 0.35 };
+
+        let (at_start, at_end) = match self.selected {
+            Some(i) => (i == 0, i + 1 >= self.files.len()),
+            None => (true, true),
+        };
+        let mut action = info::CullAction::default();
+        egui::Area::new(egui::Id::new("cull_bar"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(anchor)
+            .pivot(egui::Align2::CENTER_BOTTOM)
+            .constrain_to(preview_rect)
+            .show(ui.ctx(), |ui| {
+                ui.set_opacity(opacity);
+                egui::Frame::popup(ui.style())
+                    .corner_radius(8.0)
+                    .show(ui, |ui| {
+                        action = info::cull_bar(
+                            ui,
+                            &mut self.params,
+                            &mut self.auto_advance,
+                            at_start,
+                            at_end,
+                        );
+                    });
+            });
+
+        if action.changed {
+            self.params_edited();
+            if self.auto_advance {
+                action.step = 1;
+            }
+        }
+        if action.step != 0 {
+            self.select_relative(action.step);
+        }
     }
 }
 
@@ -1255,12 +1423,14 @@ impl eframe::App for App {
                 .default_width(170.0)
                 .width_range(110.0..=320.0)
                 .show(ctx, |ui| {
+                    let scroll = std::mem::take(&mut self.scroll_filmstrip);
                     if let Some(i) = filmstrip::show(
                         ui,
                         &self.files,
                         self.selected,
                         &self.thumb_tex,
                         &self.meta_cache,
+                        scroll,
                     ) {
                         self.select_photo(i);
                     }

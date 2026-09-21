@@ -6,12 +6,16 @@ use std::path::PathBuf;
 
 use crate::engine::params::Flag;
 
+/// `scroll_to_selected` brings the selected thumbnail into view — set it when
+/// something other than a click moved the selection (the culling arrow keys),
+/// otherwise keyboard navigation walks straight off the visible strip.
 pub fn show(
     ui: &mut egui::Ui,
     files: &[PathBuf],
     selected: Option<usize>,
     thumbs: &HashMap<PathBuf, egui::TextureHandle>,
     meta: &HashMap<PathBuf, (u8, Flag)>,
+    scroll_to_selected: bool,
 ) -> Option<usize> {
     let mut clicked = None;
     egui::ScrollArea::vertical()
@@ -63,6 +67,9 @@ pub fn show(
                     };
                     if resp.clicked() {
                         clicked = Some(i);
+                    }
+                    if is_selected && scroll_to_selected {
+                        resp.scroll_to_me(Some(egui::Align::Center));
                     }
                     resp.on_hover_text(&name);
                     let label_text = egui::RichText::new(name).small();

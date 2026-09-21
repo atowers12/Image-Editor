@@ -46,6 +46,10 @@ for the interface. This project is made to be extended, full source code is avai
 - **Ratings & flags**: 0–5 stars and pick/reject flags (keys `0`–`5`, `P`, `X`),
   shown as badges in the filmstrip for culling
 - **EXIF panel**: camera, lens, focal length, aperture, shutter, ISO, date
+- **Culling**: Lightroom's keys — arrows to move through the folder, `0`–`5` to rate,
+  `[` / `]` to nudge, `P` / `X` / `U` to flag, and `Shift` to apply-and-advance (or
+  latch it with auto advance). A cull bar floats over the photo with the same
+  controls, and ratings show as filmstrip badges
 - **Undo / redo**: full per-photo history (`Ctrl+Z` / `Ctrl+Y`)
 - **Crop & Rotate** (non-destructive): interactive crop with aspect-ratio locks
   (original, 1:1, 3:2, 4:3, 16:9, …), 90° rotation, horizontal/vertical flip,
@@ -118,7 +122,8 @@ optimizations because pixel processing is far too slow without them.
 | See what a mask selects | **Show mask coverage** at the top of the mask panel |
 | Mask by color / brightness | Open **Range** on the mask; **💧 Pick color** targets the hue you click |
 | Brush around edges | Tick **Auto mask** before painting |
-| Rate / flag | Click the stars/flags in the panel, or use the [keyboard shortcuts](#keyboard-shortcuts) |
+| Rate / flag | The cull bar over the photo, the stars/flags in the right panel, or the [keyboard shortcuts](#keyboard-shortcuts) |
+| Cull a folder | `Shift`+rating/flag applies it and moves on; or turn on ⏭ auto advance and use plain keys. `←` `→` step through photos |
 | Presets | **🎨 Presets** — apply a saved look or save the current one |
 | Undo / redo | The ↩ ↪ buttons, or `Ctrl+Z` / `Ctrl+Y` |
 | Copy edits | **🗐 Copy**, then **📋 Paste** on another photo, or **📋 All** for the whole folder |
@@ -127,24 +132,56 @@ optimizations because pixel processing is far too slow without them.
 
 ## Keyboard shortcuts
 
+Lightroom's culling keys, so muscle memory carries over.
+
 | Key | Does |
 |---|---|
+| `←` `→` *or* `↑` `↓` | Previous / next photo (hold to walk the folder) |
 | `0` – `5` | Set the star rating (`0` clears it) |
+| `[` `]` | Nudge the rating down / up one star |
 | `P` | Toggle the **pick** flag |
 | `X` | Toggle the **reject** flag |
+| `U` | Clear the flag |
+| `Shift` + any of the above ratings/flags | Apply it, then jump to the next photo |
 | `Ctrl+Z` | Undo |
 | `Ctrl+Y` *or* `Ctrl+Shift+Z` | Redo |
 
-`P` and `X` toggle: pressing the key that's already set clears the flag, so `X` on a
-rejected photo un-rejects it rather than doing nothing. Setting a rating or a flag is
-an ordinary edit — it lands in the undo history and the sidecar like any slider.
+### Culling
 
-Two things suppress every shortcut above:
+The intended loop is: look, press a rating or flag with `Shift` held, land on the
+next photo, repeat. If you'd rather not hold `Shift` for a whole pass, turn on
+**auto advance** (the ⏭ button on the cull bar) and every plain rating or flag
+advances too. Lightroom binds that to Caps Lock; egui can't read Caps Lock reliably,
+so it's a button here.
+
+The **cull bar** floats over the bottom of the photo in Adjust mode — stars,
+pick/reject/clear, auto-advance, and prev/next. It dims while your pointer is up in
+the image and comes back to full strength as you approach it. It's hidden in Crop and
+Mask mode, where it would sit on top of the handles you're dragging.
+
+Arrowing onto a photo scrolls the filmstrip to keep it in view, and holding an arrow
+paces itself rather than running at the key-repeat rate, so a fast sweep through a
+folder of RAWs doesn't queue up a decode for every file it passes.
+
+### Notes
+
+`P` and `X` toggle: pressing the key that's already set clears the flag, so `X` on a
+rejected photo un-rejects it rather than doing nothing. `U` always clears. Setting a
+rating or a flag is an ordinary edit — it lands in the undo history and the sidecar
+like any slider, and the filmstrip badge updates with it.
+
+`Shift+1` reports as `!` rather than `1` on most layouts, so the digit keys are
+matched on the physical key as well as the logical one. Letters are matched both
+ways too, so `P` / `X` / `U` stay on the printed letter on non-US layouts.
+
+Three things suppress every shortcut above:
 
 - **No photo open.** They're ignored on the welcome screen.
 - **A text field has focus** — in practice the **🎨 Presets** name box, the only one
   in the app. Keys go to the field instead, so typing "Portrait 2x" as a preset name
   won't re-rate the photo underneath. Click away from the field to get them back.
+- **A slider or other widget has keyboard focus**, so the arrow keys nudge that
+  widget instead of changing photo. Click the image to hand focus back.
 
 `Ctrl` is `⌘` on macOS. Everything else in the app is mouse-driven; see the
 [Usage](#usage) table above, which covers the preview's drag/wheel/double-click
@@ -196,7 +233,8 @@ src/
     masks.rs          mask list, shape composition, range mask, local sliders
     filmstrip.rs      thumbnail strip with rating/flag badges
     histogram.rs      histogram plot + clipping toggles
-    info.rs           star rating / flag controls + EXIF panel
+    info.rs           star rating / flag controls, the floating cull bar,
+                      and the EXIF panel
     preview.rs        zoom/pan view (including while cropping), full-res region,
                       crop + mask overlays, eyedropper
     settings.rs       processing settings window (Tuning)
