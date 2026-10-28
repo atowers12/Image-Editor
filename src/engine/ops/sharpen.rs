@@ -12,6 +12,9 @@ use rayon::prelude::*;
 use crate::engine::blur;
 use crate::engine::ops::tone;
 
+/// Half-width of the bilateral filter's square window, in pixels.
+pub const BILATERAL_RADIUS: usize = 2;
+
 /// Sharpen `buf` in place using an unsharp mask against `blur_small`
 /// (blurred luma at the sharpen radius). `amount` is 0..~2.
 pub fn unsharp(buf: &mut [f32], lum: &[f32], blur_small: &[f32], amount: f32) {
@@ -36,7 +39,7 @@ pub fn luminance_nr(buf: &mut [f32], w: usize, h: usize, lum: &[f32], amount: f3
     if amount <= 0.0 {
         return;
     }
-    const R: isize = 2;
+    const R: isize = BILATERAL_RADIUS as isize;
     let range_sigma = 0.04 + 0.16 * amount; // wider = smooths across more contrast
     let inv_2s2 = 1.0 / (2.0 * range_sigma * range_sigma);
     // Precompute spatial weights (5x5 gaussian, sigma ~1.4).
@@ -85,13 +88,18 @@ pub fn luminance_nr(buf: &mut [f32], w: usize, h: usize, lum: &[f32], amount: f3
     });
 }
 
-/// Color noise reduction: blur chroma, keep luminance. `amount` 0..1,
-/// `dim` the long-edge-equivalent for scaling the blur radius.
-pub fn color_nr(buf: &mut [f32], w: usize, h: usize, amount: f32, dim: f32) {
+/// Chroma blur radius for color NR at `amount` (0..1), with `dim` the
+/// long-edge-equivalent the radius scales against.
+pub fn color_nr_radius(dim: f32, amount: f32) -> usize {
+    ((dim * 0.004 * amount) as usize).max(1)
+}
+
+/// Color noise reduction: blur chroma at `radius` (see `color_nr_radius`),
+/// keep luminance. `amount` 0..1.
+pub fn color_nr(buf: &mut [f32], w: usize, h: usize, amount: f32, radius: usize) {
     if amount <= 0.0 {
         return;
     }
-    let radius = ((dim * 0.004 * amount) as usize).max(1);
     // Blur each channel, then recombine blurred chroma with sharp luma.
     let (mut cr, mut cg, mut cb) = (
         vec![0.0f32; w * h],
@@ -176,7 +184,7 @@ mod tests {
             }
         }
         let before: Vec<f32> = buf.chunks(3).map(|p| p[0] - p[1]).collect();
-        color_nr(&mut buf, w, h, 1.0, w as f32 * 4.0);
+        color_nr(&mut buf, w, h, 1.0, color_nr_radius(w as f32 * 4.0, 1.0));
         let after: Vec<f32> = buf.chunks(3).map(|p| p[0] - p[1]).collect();
         assert!(variance(&after) < variance(&before));
     }

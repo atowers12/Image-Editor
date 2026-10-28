@@ -50,7 +50,7 @@ pub fn show(
                 let y_top = plot.max.y - frac * plot.height();
                 painter.line_segment(
                     [egui::pos2(x, plot.max.y), egui::pos2(x, y_top)],
-                    egui::Stroke::new(1.0, color),
+                    egui::Stroke::new(1.0_f32, color),
                 );
             }
         }
@@ -112,7 +112,7 @@ fn clip_toggle(
         painter.circle_stroke(
             rect.center(),
             6.0,
-            egui::Stroke::new(1.0, egui::Color32::from_gray(160)),
+            egui::Stroke::new(1.0_f32, egui::Color32::from_gray(160)),
         );
     }
     if resp.clicked() {

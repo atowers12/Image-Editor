@@ -133,6 +133,8 @@ pub struct App {
 
     export_dialog: ExportDialog,
     settings_open: bool,
+    /// What the render worker renders on, and how fast, for Settings.
+    render_info: settings::RenderInfo,
     preset_list: Vec<String>,
     new_preset_name: String,
     preview_state: preview::PreviewState,
@@ -151,8 +153,9 @@ impl App {
             cc.egui_ctx
                 .load_texture("app-logo", image, egui::TextureOptions::LINEAR)
         });
+        let tuning = Tuning::load();
         Self {
-            worker: worker::spawn(cc.egui_ctx.clone()),
+            worker: worker::spawn(cc.egui_ctx.clone(), tuning.use_gpu),
             thumbs: thumbs::spawn(cc.egui_ctx.clone()),
             folder: None,
             files: Vec::new(),
@@ -160,7 +163,7 @@ impl App {
             recent: recent::load(),
             meta_cache: HashMap::new(),
             params: EditParams::default(),
-            tuning: Tuning::load(),
+            tuning,
             copied_params: None,
             confirm_paste_all: false,
             sidecar_dirty: false,
@@ -201,6 +204,7 @@ impl App {
             show_mask_overlay: false,
             export_dialog: ExportDialog::default(),
             settings_open: false,
+            render_info: settings::RenderInfo::default(),
             preset_list: presets::list(),
             new_preset_name: String::new(),
             preview_state: preview::PreviewState::default(),
@@ -244,6 +248,7 @@ impl App {
     fn poll_workers(&mut self, ctx: &egui::Context) {
         while let Ok(reply) = self.worker.rx.try_recv() {
             match reply {
+                Reply::Backend(backend) => self.render_info.backend = backend,
                 Reply::Loaded {
                     path,
                     full_width,
@@ -270,7 +275,9 @@ impl App {
                     full_size,
                     histogram,
                     coverage,
+                    render_ms,
                 } => {
+                    self.render_info.preview_ms = Some(render_ms);
                     self.set_coverage_tex(ctx, width, height, coverage);
                     let img = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                     match &mut self.preview_tex {
@@ -290,7 +297,9 @@ impl App {
                     height,
                     rgba,
                     norm_rect,
+                    render_ms,
                 } => {
+                    self.render_info.region_ms = Some(render_ms);
                     let img = egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba);
                     match &mut self.region_tex {
                         Some(tex) => tex.set(img, egui::TextureOptions::LINEAR),
@@ -301,12 +310,13 @@ impl App {
                     }
                     self.region_rect = Some(norm_rect);
                 }
-                Reply::ExportDone(path) => {
+                Reply::ExportDone { path, on_gpu, secs } => {
                     self.exporting = false;
                     self.status = Some((
                         format!(
-                            "Exported {}",
-                            path.file_name().unwrap_or_default().to_string_lossy()
+                            "Exported {} in {secs:.1} s ({})",
+                            path.file_name().unwrap_or_default().to_string_lossy(),
+                            if on_gpu { "GPU" } else { "CPU" }
                         ),
                         Instant::now(),
                     ));
@@ -1450,7 +1460,7 @@ impl eframe::App for App {
         self.handle_export(ctx);
         self.paste_all_confirm(ctx);
 
-        if settings::show(ctx, &mut self.settings_open, &mut self.tuning) {
+        if settings::show(ctx, &mut self.settings_open, &mut self.tuning, &self.render_info) {
             if let Err(e) = self.tuning.save() {
                 self.error = Some((format!("couldn't save settings: {e:#}"), Instant::now()));
             }

@@ -51,7 +51,7 @@ pub fn show(ui: &mut egui::Ui, params: &mut EditParams, channel: &mut CurveChann
     painter.rect_filled(rect, 4.0, egui::Color32::from_gray(20));
 
     // Grid.
-    let grid = egui::Stroke::new(0.5, egui::Color32::from_gray(45));
+    let grid = egui::Stroke::new(0.5_f32, egui::Color32::from_gray(45));
     for i in 1..4 {
         let fx = rect.min.x + rect.width() * i as f32 / 4.0;
         let fy = rect.min.y + rect.height() * i as f32 / 4.0;
@@ -94,7 +94,7 @@ pub fn show(ui: &mut egui::Ui, params: &mut EditParams, channel: &mut CurveChann
         let x = i as f32 / (lut.len() - 1) as f32;
         poly.push(to_screen(x, *v));
     }
-    painter.add(egui::Shape::line(poly, egui::Stroke::new(1.5, ch_color)));
+    painter.add(egui::Shape::line(poly, egui::Stroke::new(1.5_f32, ch_color)));
 
     // Interaction state persisted across frames: which point is being dragged.
     let drag_id = ui.id().with("curve_drag");
@@ -167,7 +167,7 @@ pub fn show(ui: &mut egui::Ui, params: &mut EditParams, channel: &mut CurveChann
     for q in pts.iter() {
         let c = to_screen(q[0], q[1]);
         painter.circle_filled(c, 4.0, egui::Color32::WHITE);
-        painter.circle_stroke(c, 4.0, egui::Stroke::new(1.0, ch_color));
+        painter.circle_stroke(c, 4.0, egui::Stroke::new(1.0_f32, ch_color));
     }
 
     ui.data_mut(|d| d.insert_temp(drag_id, dragging));

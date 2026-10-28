@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
+use crate::engine::gpu;
 use crate::engine::ops::geometry;
 use crate::engine::params::EditParams;
 use crate::engine::pipeline::{self, RenderCtx, SourceImage};
@@ -43,8 +44,20 @@ impl ExportFormat {
     }
 }
 
+/// How an export was rendered.
+#[derive(Default)]
+pub struct ExportReport {
+    /// The GPU rendered it (in tiles); otherwise the CPU did.
+    pub on_gpu: bool,
+    /// The GPU failed partway and the CPU took over. The caller should stop
+    /// using that GPU.
+    pub gpu_error: Option<String>,
+}
+
 /// Render `src` (geometry already applied) at full resolution with `params`
-/// and write it to `dest`.
+/// and write it to `dest`. Renders on `gpu` when one is given and the edit
+/// tiles onto it; otherwise — or if it fails — on the CPU, with the same
+/// result either way.
 pub fn export(
     src: &SourceImage,
     params: &EditParams,
@@ -52,13 +65,27 @@ pub fn export(
     dest: &Path,
     format: ExportFormat,
     jpeg_quality: u8,
-) -> Result<()> {
-    let rgb_f32 = pipeline::render_rgb(src, params, tuning, RenderCtx::full(src.width, src.height));
-    let mut bytes = vec![0u8; rgb_f32.len()];
-    bytes
-        .par_iter_mut()
-        .zip(rgb_f32.par_iter())
-        .for_each(|(d, s)| *d = (s * 255.0 + 0.5) as u8);
+    gpu: Option<&mut gpu::Renderer>,
+) -> Result<ExportReport> {
+    let mut report = ExportReport::default();
+    let on_gpu = gpu.and_then(|g| match g.render_export(src, params, tuning) {
+        Ok(rgb) => rgb,
+        Err(e) => {
+            report.gpu_error = Some(format!("GPU error: {e:#}"));
+            None
+        }
+    });
+    report.on_gpu = on_gpu.is_some();
+    let bytes = on_gpu.unwrap_or_else(|| {
+        let ctx = RenderCtx::full(src.width, src.height);
+        let rgb_f32 = pipeline::render_rgb(src, params, tuning, ctx);
+        let mut bytes = vec![0u8; rgb_f32.len()];
+        bytes
+            .par_iter_mut()
+            .zip(rgb_f32.par_iter())
+            .for_each(|(d, s)| *d = (s * 255.0 + 0.5) as u8);
+        bytes
+    });
     let img: image::RgbImage =
         image::ImageBuffer::from_raw(src.width as u32, src.height as u32, bytes)
             .context("failed to build output image buffer")?;
@@ -77,7 +104,7 @@ pub fn export(
                 .with_context(|| format!("failed to save {}", dest.display()))?;
         }
     }
-    Ok(())
+    Ok(report)
 }
 
 // --- Batch export ---
@@ -100,6 +127,9 @@ pub struct BatchJob {
 /// Export every file with its own sidecar edits (or clean defaults) into
 /// `dest_dir` as `{stem}_edited.{ext}`. Runs on its own thread so the
 /// interactive render worker stays responsive; decodes each file fresh.
+/// With `tuning.use_gpu`, the thread opens its own GPU renderer for the
+/// batch — separate from the worker's, so neither's memory or failures
+/// touch the other — and drops back to the CPU if it fails.
 pub fn spawn_batch(
     files: Vec<PathBuf>,
     dest_dir: PathBuf,
@@ -115,6 +145,11 @@ pub fn spawn_batch(
     std::thread::Builder::new()
         .name("batch-export".into())
         .spawn(move || {
+            let mut gpu = if tuning.use_gpu {
+                gpu::Renderer::new().ok()
+            } else {
+                None
+            };
             let mut exported = 0usize;
             let mut failed = 0usize;
             for (index, src_path) in files.iter().enumerate() {
@@ -131,8 +166,13 @@ pub fn spawn_batch(
                     name: name.clone(),
                 });
                 ctx.request_repaint();
-                match export_one(src_path, &dest_dir, format, jpeg_quality, &tuning) {
-                    Ok(()) => exported += 1,
+                match export_one(src_path, &dest_dir, format, jpeg_quality, &tuning, gpu.as_mut()) {
+                    Ok(report) => {
+                        exported += 1;
+                        if report.gpu_error.is_some() {
+                            gpu = None; // the rest of the batch goes to the CPU
+                        }
+                    }
                     Err(e) => {
                         failed += 1;
                         let _ = tx.send(BatchMsg::Failed {
@@ -155,7 +195,8 @@ fn export_one(
     format: ExportFormat,
     jpeg_quality: u8,
     tuning: &Tuning,
-) -> Result<()> {
+    gpu: Option<&mut gpu::Renderer>,
+) -> Result<ExportReport> {
     let params = sidecar::load(src_path).unwrap_or_default();
     let src = loader::load(src_path)?;
     let geo;
@@ -171,5 +212,5 @@ fn export_one(
         .to_string_lossy()
         .to_string();
     let dest = dest_dir.join(format!("{stem}_edited.{}", format.extension()));
-    export(render_src, &params, tuning, &dest, format, jpeg_quality)
+    export(render_src, &params, tuning, &dest, format, jpeg_quality, gpu)
 }

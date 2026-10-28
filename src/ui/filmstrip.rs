@@ -58,7 +58,7 @@ pub fn show(
                                 ui.painter().rect_stroke(
                                     rect,
                                     4.0,
-                                    egui::Stroke::new(2.0, ui.visuals().selection.bg_fill),
+                                    egui::Stroke::new(2.0_f32, ui.visuals().selection.bg_fill),
                                     egui::StrokeKind::Outside,
                                 );
                             }

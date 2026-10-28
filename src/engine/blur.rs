@@ -4,12 +4,16 @@
 
 use rayon::prelude::*;
 
+/// Box-blur iterations per Gaussian. A blur of radius `r` therefore reads
+/// pixels up to `BLUR_PASSES * r` away along each axis.
+pub const BLUR_PASSES: usize = 3;
+
 /// Blur `src` (w*h, row-major) with an approximate Gaussian of the given radius.
 pub fn gaussian_approx(src: &[f32], w: usize, h: usize, radius: usize) -> Vec<f32> {
     let radius = radius.max(1);
     let mut a = src.to_vec();
     let mut b = vec![0.0; src.len()];
-    for _ in 0..3 {
+    for _ in 0..BLUR_PASSES {
         box_blur_rows(&a, &mut b, w, h, radius);
         transpose(&b, &mut a, w, h);
         box_blur_rows(&a, &mut b, h, w, radius);

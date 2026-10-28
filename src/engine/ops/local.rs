@@ -9,11 +9,11 @@ use crate::engine::params::LocalAdjust;
 /// Fixed strengths for local effects. Global equivalents read the user's
 /// Tuning; local masks use these so a mask behaves the same whatever the
 /// global sliders are set to.
-const LOCAL_RANGE_STRENGTH: f32 = 0.30;
-const LOCAL_TEXTURE_STRENGTH: f32 = 0.55;
-const LOCAL_CLARITY_STRENGTH: f32 = 0.45;
-const LOCAL_SHARPEN_STRENGTH: f32 = 0.70;
-const LOCAL_DEHAZE_STRENGTH: f32 = 0.30;
+pub const LOCAL_RANGE_STRENGTH: f32 = 0.30;
+pub const LOCAL_TEXTURE_STRENGTH: f32 = 0.55;
+pub const LOCAL_CLARITY_STRENGTH: f32 = 0.45;
+pub const LOCAL_SHARPEN_STRENGTH: f32 = 0.70;
+pub const LOCAL_DEHAZE_STRENGTH: f32 = 0.30;
 
 /// The spatial inputs a local adjustment needs beyond the pixel itself:
 /// blurred luminance at three radii, and the pixel as it would look fully

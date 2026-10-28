@@ -437,7 +437,7 @@ fn crop_overlay(
     painter.rect_stroke(
         img_rect,
         0.0,
-        egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(70)),
         egui::StrokeKind::Middle,
     );
 
@@ -456,13 +456,13 @@ fn crop_overlay(
         } else {
             egui::Color32::from_white_alpha(50)
         };
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0, edge)));
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(1.0_f32, edge)));
     }
 
     // Border, rule-of-thirds grid, and handles.
-    let stroke = egui::Stroke::new(1.5, egui::Color32::from_gray(230));
+    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_gray(230));
     painter.rect_stroke(crop_rect, 0.0, stroke, egui::StrokeKind::Middle);
-    let thin = egui::Stroke::new(0.7, egui::Color32::from_white_alpha(90));
+    let thin = egui::Stroke::new(0.7_f32, egui::Color32::from_white_alpha(90));
     for i in 1..3 {
         let fx = crop_rect.min.x + crop_rect.width() * i as f32 / 3.0;
         let fy = crop_rect.min.y + crop_rect.height() * i as f32 / 3.0;
@@ -761,7 +761,7 @@ fn draw_component_outline(
     c: &MaskComponent,
     color: egui::Color32,
 ) {
-    let stroke = egui::Stroke::new(1.0, color);
+    let stroke = egui::Stroke::new(1.0_f32, color);
     match &c.kind {
         MaskKind::Radial { center, radius, .. } => {
             draw_ellipse(
@@ -817,7 +817,7 @@ fn mask_overlay(
     let Some(active_op) = m.components.get(selected).map(|c| op_of(selected, c)) else {
         return false;
     };
-    let line = egui::Stroke::new(1.5, component_color(active_op, true));
+    let line = egui::Stroke::new(1.5_f32, component_color(active_op, true));
     let handle_fill = egui::Color32::from_gray(245);
     let mut changed = false;
     let Some(component) = m.components.get_mut(selected) else {
@@ -841,7 +841,7 @@ fn mask_overlay(
                 c,
                 rx * inner,
                 ry * inner,
-                egui::Stroke::new(0.7, egui::Color32::from_white_alpha(70)),
+                egui::Stroke::new(0.7_f32, egui::Color32::from_white_alpha(70)),
             );
             // Handles: center + right (rx) + bottom (ry).
             let h_right = egui::pos2(c.x + rx, c.y);
@@ -891,11 +891,11 @@ fn mask_overlay(
             let perp = egui::vec2(-dir.y, dir.x) * 40.0;
             painter.line_segment(
                 [a - perp, a + perp],
-                egui::Stroke::new(0.8, egui::Color32::from_white_alpha(90)),
+                egui::Stroke::new(0.8_f32, egui::Color32::from_white_alpha(90)),
             );
             painter.line_segment(
                 [b - perp, b + perp],
-                egui::Stroke::new(0.8, egui::Color32::from_white_alpha(90)),
+                egui::Stroke::new(0.8_f32, egui::Color32::from_white_alpha(90)),
             );
             painter.circle_filled(a, 5.0, handle_fill);
             painter.circle_filled(b, 5.0, handle_fill);
@@ -947,14 +947,14 @@ fn mask_overlay(
                 } else {
                     egui::Color32::from_rgb(140, 220, 255)
                 };
-                painter.circle_stroke(p, r, egui::Stroke::new(1.0, col));
+                painter.circle_stroke(p, r, egui::Stroke::new(1.0_f32, col));
                 // A second ring marks auto-masking, which restricts the dab
                 // to pixels matching whatever is under the cursor.
                 if brush.auto_mask {
                     painter.circle_stroke(
                         p,
                         r + 3.0,
-                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(70)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(70)),
                     );
                 }
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);

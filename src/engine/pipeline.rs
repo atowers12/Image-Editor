@@ -81,6 +81,98 @@ impl SourceImage {
             data: out,
         }
     }
+
+    /// Exact pixel copy of the `w`×`h` block at (`x`, `y`) — no resampling,
+    /// so a tile cut from an image renders exactly as that part of the whole.
+    pub fn crop_px(&self, x: usize, y: usize, w: usize, h: usize) -> SourceImage {
+        let mut data = Vec::with_capacity(w * h * 3);
+        for row in y..y + h {
+            let start = (row * self.width + x) * 3;
+            data.extend_from_slice(&self.data[start..start + w * 3]);
+        }
+        SourceImage {
+            width: w,
+            height: h,
+            data,
+        }
+    }
+}
+
+/// The spatial stages a render will run — the ones that read neighbouring
+/// pixels — and how far each reaches, in buffer pixels. `None`/`false` means
+/// the stage is skipped. The CPU pipeline, the GPU pipeline and tiled export
+/// all size their work from here, so the three can't drift apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StageRadii {
+    /// Global luminance noise reduction (bilateral, `BILATERAL_RADIUS`).
+    pub lum_nr: bool,
+    /// Global color noise reduction chroma blur.
+    pub color_nr: Option<usize>,
+    pub texture: Option<usize>,
+    pub clarity: Option<usize>,
+    pub sharpen: Option<usize>,
+    /// Blurs and the denoised copy that local masks read, all taken from the
+    /// buffer as it leaves the detail stage.
+    pub local_texture: Option<usize>,
+    pub local_clarity: Option<usize>,
+    pub local_sharpen: Option<usize>,
+    pub local_denoise: bool,
+}
+
+impl StageRadii {
+    /// `dim` is the long-edge-equivalent the radii scale against
+    /// (`RenderCtx::radius_dim`).
+    pub fn new(p: &EditParams, t: &Tuning, dim: f32) -> Self {
+        let texture = ((dim * t.texture_radius) as usize).max(1);
+        let clarity = ((dim * t.clarity_radius) as usize).max(2);
+        let needs = |f: fn(&LocalAdjust) -> bool| p.active_masks().any(|m| f(&m.adjust));
+        StageRadii {
+            lum_nr: p.luminance_nr > 0.0,
+            color_nr: (p.color_nr > 0.0)
+                .then(|| sharpen::color_nr_radius(dim, p.color_nr / 100.0)),
+            texture: (p.texture != 0.0).then_some(texture),
+            clarity: (p.clarity != 0.0).then_some(clarity),
+            // Sharpen radius from the user slider (in px of the render).
+            sharpen: (p.sharpen > 0.0)
+                .then(|| ((dim * 0.001 * p.sharpen_radius) as usize).max(1)),
+            local_texture: needs(local::needs_texture_blur).then_some(texture),
+            local_clarity: needs(local::needs_clarity_blur).then_some(clarity),
+            local_sharpen: needs(local::needs_sharpen_blur).then(|| ((dim * 0.0015) as usize).max(1)),
+            local_denoise: needs(local::needs_denoise),
+        }
+    }
+
+    /// Does the detail stage (texture / clarity / sharpen) run?
+    pub fn any_detail(&self) -> bool {
+        self.texture.is_some() || self.clarity.is_some() || self.sharpen.is_some()
+    }
+
+    /// Do local masks need luminance-derived buffers?
+    pub fn any_local(&self) -> bool {
+        self.local_texture.is_some()
+            || self.local_clarity.is_some()
+            || self.local_sharpen.is_some()
+            || self.local_denoise
+    }
+
+    /// How far a finished pixel can depend on source pixels, in buffer
+    /// pixels along either axis. Stages run in sequence, so their reaches
+    /// add up; stages that read the same buffer (texture and clarity, the
+    /// local blurs and the local denoise) only contribute their widest.
+    /// A tile grown by this much on every side renders its middle exactly as
+    /// the full image would.
+    pub fn halo(&self) -> usize {
+        let blur = |r: Option<usize>| r.map_or(0, |r| r * blur::BLUR_PASSES);
+        let bilateral = |on: bool| if on { sharpen::BILATERAL_RADIUS } else { 0 };
+        bilateral(self.lum_nr)
+            + blur(self.color_nr)
+            + blur(self.texture).max(blur(self.clarity))
+            + blur(self.sharpen)
+            + blur(self.local_texture)
+                .max(blur(self.local_clarity))
+                .max(blur(self.local_sharpen))
+                .max(bilateral(self.local_denoise))
+    }
 }
 
 /// Where the buffer being rendered sits inside the full geometry-applied
@@ -102,6 +194,9 @@ impl RenderCtx {
         }
     }
 }
+
+/// Unsharp-mask amount at a full Sharpen slider.
+pub const SHARPEN_GAIN: f32 = 1.5;
 
 #[inline]
 pub fn srgb_encode(x: f32) -> f32 {
@@ -188,42 +283,37 @@ pub fn render_rgb(src: &SourceImage, p: &EditParams, t: &Tuning, ctx: RenderCtx)
         }
     });
 
+    let radii = StageRadii::new(p, t, ctx.radius_dim);
+
     // --- Pass 2a (spatial): noise reduction (luma bilateral + chroma blur) ---
-    let lum_nr = p.luminance_nr / 100.0;
-    let col_nr = p.color_nr / 100.0;
-    if lum_nr > 0.0 || col_nr > 0.0 {
-        if lum_nr > 0.0 {
-            let lum: Vec<f32> = buf
-                .par_chunks(3)
-                .map(|px| tone::luma(px[0], px[1], px[2]))
-                .collect();
-            sharpen::luminance_nr(&mut buf, w, h, &lum, lum_nr);
-        }
-        if col_nr > 0.0 {
-            sharpen::color_nr(&mut buf, w, h, col_nr, ctx.radius_dim);
-        }
+    if radii.lum_nr {
+        let lum: Vec<f32> = buf
+            .par_chunks(3)
+            .map(|px| tone::luma(px[0], px[1], px[2]))
+            .collect();
+        sharpen::luminance_nr(&mut buf, w, h, &lum, p.luminance_nr / 100.0);
+    }
+    if let Some(radius) = radii.color_nr {
+        sharpen::color_nr(&mut buf, w, h, p.color_nr / 100.0, radius);
     }
 
     // --- Pass 2b (spatial): texture + clarity + sharpen via blurred luma ---
     let tx = p.texture / 100.0;
     let cl = p.clarity / 100.0;
-    let sharp = p.sharpen / 100.0 * 1.5; // full slider ≈ 1.5× unsharp
-    if tx != 0.0 || cl != 0.0 || sharp > 0.0 {
+    let sharp = p.sharpen / 100.0 * SHARPEN_GAIN;
+    if radii.any_detail() {
         let lum: Vec<f32> = buf
             .par_chunks(3)
             .map(|px| tone::luma(px[0], px[1], px[2]))
             .collect();
-        let dim = ctx.radius_dim;
-        let blur_small = if tx != 0.0 {
-            blur::gaussian_approx(&lum, w, h, ((dim * t.texture_radius) as usize).max(1))
-        } else {
-            Vec::new()
-        };
-        let blur_large = if cl != 0.0 {
-            blur::gaussian_approx(&lum, w, h, ((dim * t.clarity_radius) as usize).max(2))
-        } else {
-            Vec::new()
-        };
+        let blur_small = radii
+            .texture
+            .map(|r| blur::gaussian_approx(&lum, w, h, r))
+            .unwrap_or_default();
+        let blur_large = radii
+            .clarity
+            .map(|r| blur::gaussian_approx(&lum, w, h, r))
+            .unwrap_or_default();
         if tx != 0.0 || cl != 0.0 {
             let (tx_s, cl_s) = (t.texture_strength, t.clarity_strength);
             buf.par_chunks_mut(3).enumerate().for_each(|(i, px)| {
@@ -239,9 +329,7 @@ pub fn render_rgb(src: &SourceImage, p: &EditParams, t: &Tuning, ctx: RenderCtx)
                 }
             });
         }
-        if sharp > 0.0 {
-            // Sharpen radius from the user slider (in px of the render).
-            let radius = ((dim * 0.001 * p.sharpen_radius) as usize).max(1);
+        if let Some(radius) = radii.sharpen {
             let sharp_lum: Vec<f32> = buf
                 .par_chunks(3)
                 .map(|px| tone::luma(px[0], px[1], px[2]))
@@ -260,7 +348,7 @@ pub fn render_rgb(src: &SourceImage, p: &EditParams, t: &Tuning, ctx: RenderCtx)
     let vig = p.vignette / 100.0;
 
     // Prepare local adjustment masks (brush coverage + blur buffers).
-    let local = LocalPass::prepare(p, &buf, w, h, ctx, t);
+    let local = LocalPass::prepare(p, &buf, w, h, ctx, &radii);
 
     if any_hsl || vib != 0.0 || sat != 0.0 || dh != 0.0 || vig != 0.0 || local.active() {
         // Map buffer pixel coords to normalized full-image coords.
@@ -413,37 +501,28 @@ impl LocalPass {
         w: usize,
         h: usize,
         ctx: RenderCtx,
-        t: &Tuning,
+        radii: &StageRadii,
     ) -> Self {
         let masks: Vec<PreparedMask> = p
             .active_masks()
             .map(|m| PreparedMask::new(m, buf, w, h, ctx))
             .collect();
 
-        let needs = |f: fn(&LocalAdjust) -> bool| masks.iter().any(|m| f(&m.adjust));
-        let (need_tx, need_cl) = (
-            needs(local::needs_texture_blur),
-            needs(local::needs_clarity_blur),
-        );
-        let need_sp = needs(local::needs_sharpen_blur);
-        let need_nr = needs(local::needs_denoise);
-
-        let dim = ctx.radius_dim;
-        let lum = (need_tx || need_cl || need_sp || need_nr).then(|| {
+        let lum = radii.any_local().then(|| {
             buf.par_chunks(3)
                 .map(|px| tone::luma(px[0], px[1], px[2]))
                 .collect::<Vec<f32>>()
         });
-        let blur_at = |on: bool, radius: usize| match (&lum, on) {
-            (Some(l), true) => blur::gaussian_approx(l, w, h, radius),
+        let blur_at = |radius: Option<usize>| match (&lum, radius) {
+            (Some(l), Some(r)) => blur::gaussian_approx(l, w, h, r),
             _ => Vec::new(),
         };
-        let blur_texture = blur_at(need_tx, ((dim * t.texture_radius) as usize).max(1));
-        let blur_clarity = blur_at(need_cl, ((dim * t.clarity_radius) as usize).max(2));
-        let blur_sharpen = blur_at(need_sp, ((dim * 0.0015) as usize).max(1));
+        let blur_texture = blur_at(radii.local_texture);
+        let blur_clarity = blur_at(radii.local_clarity);
+        let blur_sharpen = blur_at(radii.local_sharpen);
         // The denoised copy is computed at full strength; each mask's Noise
         // slider then decides how far toward it that mask's pixels travel.
-        let denoised = match (&lum, need_nr) {
+        let denoised = match (&lum, radii.local_denoise) {
             (Some(l), true) => {
                 let mut d = buf.to_vec();
                 sharpen::luminance_nr(&mut d, w, h, l, 1.0);
@@ -585,7 +664,7 @@ pub fn mask_coverage(m: &Mask, buf: &[f32], w: usize, h: usize, ctx: RenderCtx) 
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn test_image() -> SourceImage {
@@ -1039,6 +1118,160 @@ mod tests {
                 let f = full[(y * n + (x + n / 2)) * 3];
                 let r = region[(y * (n / 2) + x) * 3];
                 assert!((f - r).abs() < 1e-3, "mismatch at {x},{y}: {f} vs {r}");
+            }
+        }
+    }
+
+    /// A deterministic noisy gradient, so spatial stages have detail to chew on.
+    pub(crate) fn noisy_image(w: usize, h: usize) -> SourceImage {
+        let mut data = Vec::with_capacity(w * h * 3);
+        let mut seed = 0x9e37_79b9u32;
+        for y in 0..h {
+            for x in 0..w {
+                let base = [
+                    x as f32 / w as f32,
+                    y as f32 / h as f32,
+                    0.5 + 0.4 * ((x + 2 * y) as f32 * 0.07).sin(),
+                ];
+                for b in base {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    let noise = (seed % 1000) as f32 / 1000.0 - 0.5;
+                    data.push((b * 0.6 + noise * 0.12).max(0.0));
+                }
+            }
+        }
+        SourceImage {
+            width: w,
+            height: h,
+            data,
+        }
+    }
+
+    /// Params exercising every spatial stage, including local ones and an
+    /// auto-masked brush.
+    pub(crate) fn every_spatial_stage() -> EditParams {
+        use crate::engine::params::{Dab, LocalAdjust, Mask, MaskComponent, MaskKind, MaskOp};
+        let mut p = EditParams::default();
+        p.exposure = 0.3;
+        p.luminance_nr = 60.0;
+        p.color_nr = 80.0;
+        p.texture = 40.0;
+        p.clarity = 50.0;
+        p.sharpen = 70.0;
+        p.sharpen_radius = 2.0;
+        p.vignette = -40.0;
+        p.masks.push(Mask {
+            name: "m".into(),
+            components: vec![
+                MaskComponent::new(
+                    MaskKind::Radial {
+                        center: [0.4, 0.5],
+                        radius: [0.4, 0.3],
+                        feather: 0.5,
+                    },
+                    MaskOp::Add,
+                ),
+                MaskComponent::new(
+                    MaskKind::Brush {
+                        dabs: vec![Dab {
+                            p: [0.6, 0.4],
+                            radius: 0.2,
+                            hardness: 0.5,
+                            erase: false,
+                            auto: Some([0.5, 0.45, 0.6]),
+                        }],
+                    },
+                    MaskOp::Add,
+                ),
+            ],
+            adjust: LocalAdjust {
+                exposure: 30.0,
+                texture: 40.0,
+                clarity: -30.0,
+                sharpness: 50.0,
+                noise: 60.0,
+                ..LocalAdjust::default()
+            },
+            ..Mask::default()
+        });
+        p
+    }
+
+    /// Render `src` as tiles of at most `edge` px, each grown by `halo`.
+    fn render_tiled(src: &SourceImage, p: &EditParams, t: &Tuning, halo: usize, edge: usize) -> Vec<f32> {
+        let (w, h) = (src.width, src.height);
+        let tiles = crate::engine::tiling::plan_tiles(w, h, halo, edge).expect("halo fits");
+        assert!(tiles.len() > 1, "test should exercise several tiles");
+        let mut out = vec![0.0f32; w * h * 3];
+        for tile in tiles {
+            let [ox, oy, ow, oh] = tile.outer;
+            let rgb = render_rgb(&src.crop_px(ox, oy, ow, oh), p, t, tile.ctx(w, h));
+            let [ix, iy, iw, ih] = tile.inner_in_outer();
+            for y in 0..ih {
+                let from = ((iy + y) * ow + ix) * 3;
+                let to = ((tile.inner[1] + y) * w + tile.inner[0]) * 3;
+                out[to..to + iw * 3].copy_from_slice(&rgb[from..from + iw * 3]);
+            }
+        }
+        out
+    }
+
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn tiled_render_matches_full_render() {
+        let src = noisy_image(180, 120);
+        let p = every_spatial_stage();
+        // Wider-than-default radii so the halo is several pixels per stage.
+        let t = Tuning {
+            texture_radius: 0.01,
+            clarity_radius: 0.02,
+            ..Tuning::default()
+        };
+        let halo = StageRadii::new(&p, &t, 180.0).halo();
+        assert!(halo >= 20, "halo {halo}");
+        let full = render_rgb(&src, &p, &t, RenderCtx::full(180, 120));
+        let edge = 4 * halo; // the tightest edge the planner accepts
+        let tiled = render_tiled(&src, &p, &t, halo, edge);
+        let d = max_diff(&full, &tiled);
+        assert!(d < 1e-4, "tiled render differs from full render by {d}");
+
+        // And the halo is what makes it work: without one, the seams show.
+        let seamy = render_tiled(&src, &p, &t, 0, edge);
+        assert!(max_diff(&full, &seamy) > 1e-3);
+    }
+
+    #[test]
+    fn halo_counts_only_active_stages() {
+        let t = Tuning::default();
+        assert_eq!(StageRadii::new(&EditParams::default(), &t, 6000.0).halo(), 0);
+        let mut p = EditParams::default();
+        p.clarity = 20.0;
+        // Clarity alone: three box passes at 1% of the long edge.
+        assert_eq!(StageRadii::new(&p, &t, 6000.0).halo(), 3 * 60);
+        p.texture = 20.0; // shares clarity's buffer, so only the wider counts
+        assert_eq!(StageRadii::new(&p, &t, 6000.0).halo(), 3 * 60);
+        p.luminance_nr = 10.0; // runs before, so it adds
+        assert_eq!(StageRadii::new(&p, &t, 6000.0).halo(), 3 * 60 + 2);
+    }
+
+    #[test]
+    fn crop_px_copies_exact_pixels() {
+        let src = noisy_image(10, 8);
+        let c = src.crop_px(3, 2, 4, 5);
+        assert_eq!((c.width, c.height), (4, 5));
+        for y in 0..5 {
+            for x in 0..4 {
+                for ch in 0..3 {
+                    assert_eq!(
+                        c.data[(y * 4 + x) * 3 + ch],
+                        src.data[((y + 2) * 10 + x + 3) * 3 + ch]
+                    );
+                }
             }
         }
     }

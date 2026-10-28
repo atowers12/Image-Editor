@@ -66,6 +66,7 @@ fn import_edit_export_round_trip() {
         &out_path,
         export::ExportFormat::Jpeg,
         90,
+        None,
     )
     .unwrap();
     let exported = image::open(&out_path).unwrap();
@@ -87,6 +88,7 @@ fn import_edit_export_round_trip() {
         &identity_out,
         export::ExportFormat::Jpeg,
         90,
+        None,
     )
     .unwrap();
     let identity = image::open(&identity_out).unwrap();
@@ -206,10 +208,125 @@ fn advanced_edits_export_end_to_end() {
         &out_path,
         export::ExportFormat::Png,
         90,
+        None,
     )
     .unwrap();
     let edited = image::open(&out_path).unwrap();
     assert_eq!((edited.width(), edited.height()), (120, 90));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn worker_renders_and_exports_through_its_backend() {
+    use photo_editor::engine::params::{LocalAdjust, Mask};
+    use photo_editor::engine::worker::{self, Cmd, Reply};
+
+    let dir = std::env::temp_dir().join("photo-editor-e2e-worker");
+    std::fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("src.png");
+    let gpu_out = dir.join("worker.png");
+    let cpu_out = dir.join("cpu.png");
+    let img = image::RgbImage::from_fn(300, 200, |x, y| {
+        image::Rgb([(x % 256) as u8, (y * 255 / 200) as u8, ((x * y) % 251) as u8])
+    });
+    img.save(&src_path).unwrap();
+
+    // Geometry, spatial stages and a mask, so every part of the path is used.
+    let mut p = EditParams::default();
+    p.exposure = 0.4;
+    p.clarity = 30.0;
+    p.luminance_nr = 25.0;
+    p.vignette = -30.0;
+    p.rotate90 = 1;
+    p.angle = 3.0;
+    p.crop = [0.1, 0.05, 0.8, 0.9];
+    p.masks.push(Mask {
+        adjust: LocalAdjust {
+            exposure: 40.0,
+            texture: 30.0,
+            ..LocalAdjust::default()
+        },
+        ..Mask::default()
+    });
+    let tuning = Tuning::default();
+    let clip = (false, false);
+
+    let w = worker::spawn(egui::Context::default(), tuning.use_gpu);
+    w.tx.send(Cmd::Load {
+        path: src_path.clone(),
+        params: p.clone(),
+        tuning,
+        clip,
+    })
+    .unwrap();
+    w.tx.send(Cmd::RenderRegion {
+        params: p.clone(),
+        tuning,
+        norm_rect: [0.25, 0.25, 0.5, 0.5],
+        target: (80, 120),
+        clip,
+    })
+    .unwrap();
+    w.tx.send(Cmd::Export {
+        dest: gpu_out.clone(),
+        params: p.clone(),
+        tuning,
+        format: export::ExportFormat::Png,
+        jpeg_quality: 90,
+    })
+    .unwrap();
+
+    let (mut backend, mut preview, mut region, mut exported) = (None, false, false, None);
+    while exported.is_none() {
+        match w.rx.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(Reply::Backend(b)) => backend = Some(b),
+            Ok(Reply::Preview {
+                width,
+                height,
+                rgba,
+                render_ms,
+                ..
+            }) => {
+                assert_eq!(rgba.len(), width * height * 4);
+                assert!(render_ms >= 0.0);
+                preview = true;
+            }
+            Ok(Reply::Region {
+                width, height, rgba, ..
+            }) => {
+                assert_eq!(rgba.len(), width * height * 4);
+                region = true;
+            }
+            Ok(Reply::ExportDone { on_gpu, .. }) => exported = Some(on_gpu),
+            Ok(Reply::Error(e)) => panic!("worker error: {e}"),
+            Ok(_) => {}
+            Err(e) => panic!("worker went quiet: {e}"),
+        }
+    }
+    let backend = backend.expect("the worker reports its backend first");
+    eprintln!("worker backend: {backend}");
+    assert!(preview && region);
+    // On a machine with a GPU the export must actually have used it.
+    assert_eq!(exported, Some(backend.starts_with("GPU")));
+
+    // Whatever rendered it, the export matches the CPU pipeline's.
+    let src = loader::load(&src_path).unwrap();
+    let geo = geometry::apply(&src, &p, true);
+    export::export(&geo, &p, &tuning, &cpu_out, export::ExportFormat::Png, 90, None).unwrap();
+    let (a, b) = (
+        image::open(&gpu_out).unwrap().to_rgb8(),
+        image::open(&cpu_out).unwrap().to_rgb8(),
+    );
+    assert_eq!(a.dimensions(), b.dimensions());
+    let max = a
+        .as_raw()
+        .iter()
+        .zip(b.as_raw())
+        .map(|(x, y)| (*x as i32 - *y as i32).abs())
+        .max()
+        .unwrap();
+    assert!(max <= 2, "worker export differs from the CPU export by {max}");
 
     std::fs::remove_dir_all(&dir).ok();
 }

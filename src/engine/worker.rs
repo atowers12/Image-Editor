@@ -3,11 +3,20 @@
 //! thread never touches pixels. Commands arrive over a channel; stale
 //! preview/region render requests are coalesced so only the newest slider
 //! state is rendered.
+//!
+//! Renders run on the GPU when there is one and the user hasn't turned it
+//! off, with the CPU pipeline as the fallback for anything the GPU can't or
+//! won't do: no device, an image too large for it, or an error — after which
+//! the GPU sits out the rest of the session unless re-enabled in Settings.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
+use std::time::Instant;
 
+use crate::engine::gpu::{self, Slot};
 use crate::engine::histogram::{self, Histogram};
 use crate::engine::ops::{color, geometry};
 use crate::engine::params::EditParams;
@@ -67,6 +76,9 @@ pub enum Cmd {
 }
 
 pub enum Reply {
+    /// What renders run on now, e.g. "GPU · NVIDIA … (Vulkan)" or why it's
+    /// the CPU. Sent at startup and whenever it changes.
+    Backend(String),
     Loaded {
         path: PathBuf,
         full_width: usize,
@@ -90,14 +102,21 @@ pub enum Reply {
         /// Coverage of the mask being edited, one byte per pixel, when the
         /// "show mask coverage" overlay is on.
         coverage: Option<Vec<u8>>,
+        /// How long the render took, start to readback.
+        render_ms: f32,
     },
     Region {
         width: usize,
         height: usize,
         rgba: Vec<u8>,
         norm_rect: [f32; 4],
+        render_ms: f32,
     },
-    ExportDone(PathBuf),
+    ExportDone {
+        path: PathBuf,
+        on_gpu: bool,
+        secs: f32,
+    },
     Error(String),
 }
 
@@ -106,12 +125,22 @@ pub struct Worker {
     pub rx: Receiver<Reply>,
 }
 
-pub fn spawn(ctx: egui::Context) -> Worker {
+/// Start the worker. With `use_gpu` it opens the GPU straight away, so
+/// compiling its shaders overlaps the UI starting up rather than the first
+/// photo loading.
+pub fn spawn(ctx: egui::Context, use_gpu: bool) -> Worker {
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
     let (reply_tx, reply_rx) = std::sync::mpsc::channel::<Reply>();
     std::thread::Builder::new()
         .name("render-worker".into())
-        .spawn(move || WorkerState::default().run(cmd_rx, reply_tx, ctx))
+        .spawn(move || {
+            let mut state = WorkerState::default();
+            if let Some(reply) = state.sync_gpu(use_gpu) {
+                let _ = reply_tx.send(reply);
+                ctx.request_repaint();
+            }
+            state.run(cmd_rx, reply_tx, ctx)
+        })
         .expect("failed to spawn render worker");
     Worker {
         tx: cmd_tx,
@@ -121,8 +150,76 @@ pub fn spawn(ctx: egui::Context) -> Worker {
 
 type GeoSig = (u8, bool, bool, u32, [u32; 4]);
 
+/// The worker's GPU, if it has one.
+#[derive(Default)]
+enum GpuState {
+    Ready(Box<gpu::Renderer>),
+    /// Turned off in Settings.
+    #[default]
+    Off,
+    /// No usable GPU, or it failed; says why. Not retried until the user
+    /// turns the GPU off and on again.
+    Failed(String),
+}
+
+impl GpuState {
+    fn describe(&self) -> String {
+        match self {
+            GpuState::Ready(r) => format!("GPU · {}", r.label()),
+            GpuState::Off => "CPU · GPU turned off".into(),
+            GpuState::Failed(why) => format!("CPU · {why}"),
+        }
+    }
+}
+
+/// Run `f` on the GPU, if there is one. `Ok(None)` from `f` means "not this
+/// job" (say, an image too big for the device) and sends the caller to the
+/// CPU. An error retires the GPU, queues a `Reply::Backend` saying why, and
+/// also sends the caller to the CPU.
+fn on_gpu<T>(
+    gpu: &mut GpuState,
+    replies: &mut Vec<Reply>,
+    f: impl FnOnce(&mut gpu::Renderer) -> anyhow::Result<Option<T>>,
+) -> Option<T> {
+    let GpuState::Ready(renderer) = gpu else {
+        return None;
+    };
+    match f(renderer) {
+        Ok(out) => out,
+        Err(e) => {
+            *gpu = GpuState::Failed(format!("GPU error: {e:#}"));
+            replies.push(Reply::Backend(gpu.describe()));
+            None
+        }
+    }
+}
+
+/// Identifies one geometry-applied source image: the photo (by load) and
+/// the geometry applied to it. The GPU re-uploads a source when this changes.
+fn source_key(generation: u64, sig: GeoSig) -> u64 {
+    let mut h = DefaultHasher::new();
+    (generation, sig).hash(&mut h);
+    h.finish()
+}
+
+/// `full` with geometry applied, as cached in `full_geo` (which holds `None`
+/// when the geometry is the identity, meaning `full` itself).
+fn geo_applied<'a>(
+    full: &'a Option<SourceImage>,
+    full_geo: &'a Option<(GeoSig, Option<SourceImage>)>,
+) -> Option<&'a SourceImage> {
+    match full_geo {
+        Some((_, Some(img))) => Some(img),
+        _ => full.as_ref(),
+    }
+}
+
 #[derive(Default)]
 struct WorkerState {
+    gpu: GpuState,
+    /// Bumped on every load, so GPU uploads of one photo are never mistaken
+    /// for another's.
+    generation: u64,
     /// Full-resolution decode of the current photo (no geometry applied).
     full: Option<SourceImage>,
     /// Downscaled copy of `full` used for interactive preview renders.
@@ -171,7 +268,39 @@ impl WorkerState {
         }
     }
 
+    /// Bring the GPU in line with the Use GPU setting. Returns the new
+    /// backend description when it changed.
+    fn sync_gpu(&mut self, want: bool) -> Option<Reply> {
+        match (&self.gpu, want) {
+            (GpuState::Off, true) => {
+                self.gpu = match gpu::Renderer::new() {
+                    Ok(r) => GpuState::Ready(Box::new(r)),
+                    Err(e) => GpuState::Failed(format!("{e:#}")),
+                };
+            }
+            (GpuState::Ready(_) | GpuState::Failed(_), false) => self.gpu = GpuState::Off,
+            _ => return None,
+        }
+        Some(Reply::Backend(self.gpu.describe()))
+    }
+
     fn handle(&mut self, cmd: Cmd) -> Vec<Reply> {
+        let mut replies = Vec::new();
+        let want_gpu = match &cmd {
+            Cmd::Load { tuning, .. }
+            | Cmd::Render { tuning, .. }
+            | Cmd::RenderRegion { tuning, .. }
+            | Cmd::Export { tuning, .. } => Some(tuning.use_gpu),
+            Cmd::SampleNeutral { .. } => None,
+        };
+        if let Some(reply) = want_gpu.and_then(|want| self.sync_gpu(want)) {
+            replies.push(reply);
+        }
+        replies.extend(self.handle_cmd(cmd));
+        replies
+    }
+
+    fn handle_cmd(&mut self, cmd: Cmd) -> Vec<Reply> {
         match cmd {
             Cmd::Load {
                 path,
@@ -189,6 +318,7 @@ impl WorkerState {
                         full_height: src.height,
                         exif,
                     };
+                    self.generation += 1;
                     self.full = Some(src);
                     self.preview_base = Some(preview_base);
                     self.preview_geo = None;
@@ -220,26 +350,44 @@ impl WorkerState {
                 format,
                 jpeg_quality,
             } => {
-                if self.full.is_none() {
-                    return vec![Reply::Error("no photo loaded to export".into())];
-                }
-                let Some(src) = self.geo_full(&params) else {
+                self.refresh_full_geo(&params);
+                let Some(src) = geo_applied(&self.full, &self.full_geo) else {
                     return vec![Reply::Error("no photo loaded to export".into())];
                 };
-                match crate::imgio::export::export(
+                let started = Instant::now();
+                let gpu = match &mut self.gpu {
+                    GpuState::Ready(r) => Some(&mut **r),
+                    _ => None,
+                };
+                let result = crate::imgio::export::export(
                     src,
                     &params,
                     &tuning,
                     &dest,
                     format,
                     jpeg_quality,
-                ) {
-                    Ok(()) => vec![Reply::ExportDone(dest)],
-                    Err(e) => vec![Reply::Error(format!("export failed: {e:#}"))],
+                    gpu,
+                );
+                let mut replies = Vec::new();
+                match result {
+                    Ok(report) => {
+                        if let Some(why) = report.gpu_error {
+                            self.gpu = GpuState::Failed(why);
+                            replies.push(Reply::Backend(self.gpu.describe()));
+                        }
+                        replies.push(Reply::ExportDone {
+                            path: dest,
+                            on_gpu: report.on_gpu,
+                            secs: started.elapsed().as_secs_f32(),
+                        });
+                    }
+                    Err(e) => replies.push(Reply::Error(format!("export failed: {e:#}"))),
                 }
+                replies
             }
             Cmd::SampleNeutral { params, norm_point } => {
-                let Some(src) = self.geo_full(&params) else {
+                self.refresh_full_geo(&params);
+                let Some(src) = geo_applied(&self.full, &self.full_geo) else {
                     return Vec::new();
                 };
                 let rgb = pipeline::sample_patch(src, norm_point);
@@ -273,32 +421,52 @@ impl WorkerState {
             Some((_, Some(img))) => img,
             _ => base,
         };
-        let ctx = RenderCtx::full(src.width, src.height);
-        let rgb = pipeline::render_rgb(src, params, tuning, ctx);
+        let (w, h) = (src.width, src.height);
+        let ctx = RenderCtx::full(w, h);
+        let key = source_key(self.generation, sig);
         // The coverage wash travels as its own alpha map rather than being
         // baked into the pixels, so the preview the UI samples for brush
         // auto-masking and the color picker stays the real render.
-        let coverage = overlay
-            .and_then(|i| params.masks.get(i))
-            .map(|m| pipeline::mask_coverage(m, &rgb, src.width, src.height, ctx))
-            .map(|cov| cov.iter().map(|w| (w * 255.0 + 0.5) as u8).collect());
-        let mut rgba = pipeline::rgb_to_rgba(&rgb);
+        let overlay = overlay.and_then(|i| params.masks.get(i));
+        let started = Instant::now();
+        let mut replies = Vec::new();
+        let rendered = on_gpu(&mut self.gpu, &mut replies, |g| {
+            if !g.set_source(Slot::Preview, key, src)? {
+                return Ok(None);
+            }
+            let whole = [0.0, 0.0, 1.0, 1.0];
+            g.render(Slot::Preview, (w, h), whole, ctx, params, tuning, overlay)
+                .map(|r| Some((r.rgba, r.coverage)))
+        });
+        let (mut rgba, coverage) = rendered.unwrap_or_else(|| {
+            let rgb = pipeline::render_rgb(src, params, tuning, ctx);
+            let coverage = overlay
+                .map(|m| pipeline::mask_coverage(m, &rgb, w, h, ctx))
+                .map(|cov| cov.iter().map(|w| (w * 255.0 + 0.5) as u8).collect());
+            (pipeline::rgb_to_rgba(&rgb), coverage)
+        });
+        let render_ms = started.elapsed().as_secs_f32() * 1000.0;
         let hist = histogram::compute(&rgba);
         histogram::mark_clipping(&mut rgba, clip.0, clip.1);
         let full = self.full.as_ref().expect("preview_base implies full");
-        vec![Reply::Preview {
-            width: src.width,
-            height: src.height,
+        replies.push(Reply::Preview {
+            width: w,
+            height: h,
             rgba,
             full_size: geometry::oriented_dims(full.width, full.height, params, include_crop),
             histogram: hist,
             coverage,
-        }]
+            render_ms,
+        });
+        replies
     }
 
-    /// Get (building if stale) the geometry-applied full-resolution image.
-    fn geo_full(&mut self, params: &EditParams) -> Option<&SourceImage> {
-        let full = self.full.as_ref()?;
+    /// Build (if stale) the geometry-applied full-resolution image; read it
+    /// with `geo_applied`.
+    fn refresh_full_geo(&mut self, params: &EditParams) {
+        let Some(full) = &self.full else {
+            return;
+        };
         let sig = params.geo_signature(true);
         let stale = !matches!(&self.full_geo, Some((s, _)) if *s == sig);
         if stale {
@@ -306,10 +474,6 @@ impl WorkerState {
                 .has_geometry(true)
                 .then(|| geometry::apply(full, params, true));
             self.full_geo = Some((sig, img));
-        }
-        match &self.full_geo {
-            Some((_, Some(img))) => Some(img),
-            _ => self.full.as_ref(),
         }
     }
 
@@ -321,7 +485,8 @@ impl WorkerState {
         target: (usize, usize),
         clip: ClipFlags,
     ) -> Vec<Reply> {
-        let Some(src) = self.geo_full(params) else {
+        self.refresh_full_geo(params);
+        let Some(src) = geo_applied(&self.full, &self.full_geo) else {
             return Vec::new();
         };
         let (mut tw, mut th) = (target.0.max(1), target.1.max(1));
@@ -338,7 +503,6 @@ impl WorkerState {
         tw = ((region_w_px * scale) as usize).max(1);
         th = ((region_h_px * scale) as usize).max(1);
 
-        let region_src = src.sample_region(norm_rect, tw, th);
         // Scale blur radii as if rendering the full image at this sampling
         // density, so texture/clarity look consistent with the export.
         let radius_dim = src.width.max(src.height) as f32 * scale;
@@ -346,13 +510,31 @@ impl WorkerState {
             norm_rect,
             radius_dim,
         };
-        let mut rgba = pipeline::render_rgba(&region_src, params, tuning, ctx);
+        let key = source_key(self.generation, params.geo_signature(true));
+        let started = Instant::now();
+        let mut replies = Vec::new();
+        // On the GPU the full-resolution image stays resident, so a pan or
+        // zoom only resamples it there; the CPU resamples it per request.
+        let rendered = on_gpu(&mut self.gpu, &mut replies, |g| {
+            if !g.set_source(Slot::Full, key, src)? {
+                return Ok(None);
+            }
+            g.render(Slot::Full, (tw, th), norm_rect, ctx, params, tuning, None)
+                .map(|r| Some(r.rgba))
+        });
+        let mut rgba = rendered.unwrap_or_else(|| {
+            let region_src = src.sample_region(norm_rect, tw, th);
+            pipeline::render_rgba(&region_src, params, tuning, ctx)
+        });
+        let render_ms = started.elapsed().as_secs_f32() * 1000.0;
         histogram::mark_clipping(&mut rgba, clip.0, clip.1);
-        vec![Reply::Region {
+        replies.push(Reply::Region {
             width: tw,
             height: th,
             rgba,
             norm_rect,
-        }]
+            render_ms,
+        });
+        replies
     }
 }

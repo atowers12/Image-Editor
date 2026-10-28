@@ -385,7 +385,7 @@ fn band_picker(ui: &mut egui::Ui, active_band: &mut usize) {
                 ui.painter().rect_stroke(
                     rect,
                     rounding,
-                    egui::Stroke::new(2.0, ui.visuals().strong_text_color()),
+                    egui::Stroke::new(2.0_f32, ui.visuals().strong_text_color()),
                     egui::StrokeKind::Outside,
                 );
             }

@@ -1,9 +1,28 @@
-//! Settings window: the user-tunable processing constants (Tuning).
-//! Returns true when anything changed so the app can re-render and persist.
+//! Settings window: the user-tunable processing constants (Tuning), and
+//! where rendering happens. Returns true when anything changed so the app
+//! can re-render and persist.
 
 use crate::engine::tuning::Tuning;
 
-pub fn show(ctx: &egui::Context, open: &mut bool, tuning: &mut Tuning) -> bool {
+/// What the render worker last reported about how it renders.
+pub struct RenderInfo {
+    /// e.g. "GPU · NVIDIA GeForce RTX 3060 Ti (Vulkan)", or why it is the CPU.
+    pub backend: String,
+    pub preview_ms: Option<f32>,
+    pub region_ms: Option<f32>,
+}
+
+impl Default for RenderInfo {
+    fn default() -> Self {
+        Self {
+            backend: "Starting…".into(),
+            preview_ms: None,
+            region_ms: None,
+        }
+    }
+}
+
+pub fn show(ctx: &egui::Context, open: &mut bool, tuning: &mut Tuning, info: &RenderInfo) -> bool {
     if !*open {
         return false;
     }
@@ -50,6 +69,27 @@ pub fn show(ctx: &egui::Context, open: &mut bool, tuning: &mut Tuning) -> bool {
                     resp.on_hover_text("Long edge of the interactive preview. Applies when a photo is reopened.");
                     ui.end_row();
                 });
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.strong("Rendering");
+            changed |= ui
+                .checkbox(&mut tuning.use_gpu, "Use GPU")
+                .on_hover_text(
+                    "Render previews, zoomed views and exports on the graphics card.                      Turn off to use the CPU, which gives the same result, slower.",
+                )
+                .changed();
+            ui.label(egui::RichText::new(&info.backend).small());
+            let ms = |v: Option<f32>| v.map_or("–".to_string(), |v| format!("{v:.1} ms"));
+            ui.label(
+                egui::RichText::new(format!(
+                    "Last render: preview {} · zoomed {}",
+                    ms(info.preview_ms),
+                    ms(info.region_ms)
+                ))
+                .small()
+                .weak(),
+            );
 
             ui.add_space(8.0);
             if ui.button("Restore defaults").clicked() {

@@ -1,7 +1,9 @@
 pub mod blur;
+pub mod gpu;
 pub mod histogram;
 pub mod ops;
 pub mod params;
 pub mod pipeline;
+pub mod tiling;
 pub mod tuning;
 pub mod worker;

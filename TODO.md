@@ -4,8 +4,8 @@ Status of the original "future adds" list. Percentages are judgement calls about
 how much of the *feature as a user would expect it* exists, not how much code is
 written.
 
-**Overall: 9 of 10 shipped — roughly 92% of the roadmap, with the GPU rewrite the
-only untouched item.**
+**Overall: 10 of 10 shipped — roughly 97% of the roadmap. What's left is polish
+(sharpening finesse, filmstrip filtering, persistent history).**
 
 | # | Feature | Done | Status |
 |---|---|---|---|
@@ -18,7 +18,7 @@ only untouched item.**
 | 7 | [White-balance eyedropper](#7-white-balance-eyedropper) | 100% | ✅ Shipped |
 | 8 | [EXIF panel + ratings/flags](#8-exif-panel--star-ratingsflags) | 95% | ✅ Shipped, filmstrip filtering open |
 | 9 | [Undo/redo history](#9-undoredo-history) | 90% | ✅ Shipped, session-only |
-| 10 | [GPU pipeline (wgpu)](#10-gpu-pipeline-wgpu) | 0% | ⬜ Not started |
+| 10 | [GPU pipeline (wgpu)](#10-gpu-pipeline-wgpu) | 100% | ✅ Shipped |
 
 ---
 
@@ -202,27 +202,50 @@ Outstanding:
 
 ## 10. GPU pipeline (wgpu)
 
-**0% — not started.** No `wgpu` dependency; every stage is CPU + rayon.
+**100% — done.**
 
-Still the biggest lift and the biggest payoff. The current design already hides
-most of the latency — the worker thread owns the pixels, stale requests are
-coalesced, and full-res zoom renders only the visible rectangle at screen pixel
-density — so this buys *fully* instant full-res rendering with no region tricks,
-not a fix for something broken.
+The whole pipeline runs as wgpu compute shaders in [engine/gpu/](src/engine/gpu/),
+on a headless device owned by the render worker. eframe stays on glow: each render
+reads back RGBA8, so the histogram, clipping marks, color picker and brush
+auto-mask are untouched. The CPU pipeline is the reference and the fallback — no
+GPU, an image too big for the device, or any GPU error drops back to it — and
+**⚙ → Use GPU** switches by hand and shows the adapter and render times.
 
-Sketch, if it's ever picked up:
+- [x] **Sources on the GPU.** The preview base and the full-resolution image are
+      uploaded as half-float textures, re-sent only when the photo or its geometry
+      changes. Geometry itself stays on the CPU; it runs once per change.
+- [x] **Every stage ported**, in `render_rgb`'s order and with its skips:
+      [common.wgsl](src/engine/gpu/shaders/common.wgsl) ports the `ops/` helpers line
+      by line, and everything derivable from the sliders (gains, curve LUTs, radii)
+      is worked out on the CPU by the same code the CPU path uses.
+- [x] **`RenderCtx` semantics kept**, so vignette, masks and radius scaling match
+      at any region or resolution.
+- [x] **Blur** is a separable box pass, run 3× per axis like
+      [blur.rs](src/engine/blur.rs).
+- [x] **Export renders on the GPU**, in tiles grown by a halo — the furthest a
+      finished pixel reaches back through the blurs and noise filters
+      (`StageRadii::halo`) — so tiles match a full-frame render exactly. A CPU test
+      proves the halo by tiling the CPU pipeline; batch export opens its own
+      renderer.
+- [x] **Parity tests** ([gpu/tests.rs](src/engine/gpu/tests.rs)) render every
+      feature both ways, including zoomed regions, the coverage wash and tiled
+      export, and require agreement to within one 8-bit step; in practice they
+      match to ≤1 step with a mean difference near zero.
 
-- [ ] Move `SourceImage` to a GPU texture; keep the CPU path for export and as a
-      fallback.
-- [ ] Port the pipeline stages to compute shaders in dependency order: white
-      balance/exposure → tone → curve LUTs → detail → mixer → local → vignette.
-      The LUT-based stages (curve, mixer) port almost mechanically.
-- [ ] Keep `RenderCtx` semantics intact so position-dependent ops (vignette,
-      masks) and radius scaling stay correct at any region/resolution.
-- [ ] Blur is the interesting one — the 3× box approximation in
-      [blur.rs](src/engine/blur.rs) maps well to a separable compute pass.
-- [ ] Decide whether export renders on GPU (fast, needs exact-match validation
-      against the CPU path) or stays CPU (safe, and export isn't latency-bound).
+Follow-ups, none required:
+
+- [ ] **Zero-copy display**: switch eframe to its wgpu renderer, share its device,
+      and draw the GPU's output directly instead of reading it back and
+      re-uploading it (a few ms per frame). wgpu is pinned to egui-wgpu's version
+      so this needs no second wgpu.
+- [ ] **Halo'd zoomed regions**: a region render still clamps its blurs at the
+      viewport edge, so texture/clarity can differ slightly in a thin band at the
+      edge of the view. Rendering the region grown by the halo, as export tiles
+      are, removes it at the cost of more pixels.
+- [ ] **Dab culling**: brush rasterization tests every dab against every pixel;
+      bucketing dabs by screen tile would keep very long strokes cheap.
+- [ ] **Sliding-window blur**: the box kernel sums 2r + 1 taps per pass. Worth a
+      running-sum variant if clarity at 1:1 on very large sensors profiles slow.
 
 ---
 

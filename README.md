@@ -63,6 +63,11 @@ for the interface. This project is made to be extended, full source code is avai
   visible area from the original pixels in the background, so you always end up
   pixel-sharp — panning stays fluid because the soft preview shows instantly
   underneath while the sharp tile catches up
+- **GPU rendering**: the whole pipeline also runs as wgpu compute shaders (DirectX 12
+  or Vulkan on Windows), so previews, zoomed views and exports — single and batch —
+  render on the graphics card when there is one. The CPU pipeline is the automatic
+  fallback and produces the same pixels (to within one 8-bit step). **⚙ → Use GPU**
+  switches between them and shows the adapter and the last render times
 - **Before/After** toggle (geometry kept, pixel edits removed)
 - **Histogram & clipping warnings**: live RGB histogram above the adjustment panel;
   the corner dots toggle shadow (blue) and highlight (red) clipping overlays on the
@@ -128,7 +133,7 @@ optimizations because pixel processing is far too slow without them.
 | Undo / redo | The ↩ ↪ buttons, or `Ctrl+Z` / `Ctrl+Y` |
 | Copy edits | **🗐 Copy**, then **📋 Paste** on another photo, or **📋 All** for the whole folder |
 | Export | **💾 Export…** — current photo or all photos, format/quality, destination |
-| Tune the engine | **⚙** — effect strengths, blur radii, vignette shape, preview size |
+| Tune the engine | **⚙** — effect strengths, blur radii, vignette shape, preview size, GPU on/off |
 
 ## Keyboard shortcuts
 
@@ -200,10 +205,21 @@ src/
     tuning.rs         Tuning — user-configurable processing constants (persisted)
     histogram.rs      RGB histogram + clipping overlay marking
     pipeline.rs       SourceImage (linear-RGB f32), RenderCtx, region sampling,
-                      the render pipeline
+                      the render pipeline, StageRadii (how far each spatial
+                      stage reaches — shared by CPU, GPU and tiling)
+    tiling.rs         splitting a full-res render into halo'd tiles
     blur.rs           fast approximate Gaussian (3× box blur, transposed passes)
     worker.rs         background render thread: geometry caches, preview/region/
-                      export commands, stale-request coalescing
+                      export commands, stale-request coalescing, GPU ↔ CPU choice
+    gpu/
+      mod.rs          Renderer: resident source textures, render, tiled export
+      render.rs       the pipeline as a graph of compute dispatches
+      kernels.rs      compute pipelines + bind/dispatch helper
+      pool.rs         scratch textures, readback buffers, source uploads
+      context.rs      headless wgpu device; GPU errors → Results
+      uniforms.rs     per-kernel uniform blocks
+      shaders/        WGSL kernels; common.wgsl ports the ops/ helpers
+      tests.rs        GPU ↔ CPU parity tests (and an ignored benchmark)
     ops/
       tone.rs         contrast curve, levels, highlight/shadow/white/black masks
       curve.rs        tone-curve monotone spline → 256-entry LUTs
@@ -237,7 +253,7 @@ src/
                       and the EXIF panel
     preview.rs        zoom/pan view (including while cropping), full-res region,
                       crop + mask overlays, eyedropper
-    settings.rs       processing settings window (Tuning)
+    settings.rs       processing settings window (Tuning, GPU toggle)
     welcome.rs        start screen (open buttons, recent folders)
     export_dialog.rs  export settings window
 ```
@@ -280,17 +296,36 @@ src/
   The overlay draws the boundary itself, so the frame visibly stops at something.
 - **Interactivity**: the UI thread never touches pixels. A worker thread owns the
   decoded image plus a preview-sized copy; slider changes send parameters over a
-  channel, stale requests are dropped, and only the newest state is rendered
-  (rayon-parallel), so sliders stay real-time even for large RAW files.
+  channel, stale requests are dropped, and only the newest state is rendered, so
+  sliders stay real-time even for large RAW files.
+- **GPU and CPU**: the worker renders on the GPU through wgpu compute shaders when
+  it can, and on the CPU (rayon-parallel) when it can't. The GPU path is the CPU
+  pipeline stage for stage — `common.wgsl` ports the `ops/` helpers line by line,
+  and everything derivable from the sliders (gains, curve LUTs, blur radii) is
+  computed once on the CPU by the same code both paths use. The preview base and
+  the full-resolution image are uploaded as half-float textures once per photo and
+  geometry change; each render then runs on the GPU and reads back RGBA8, so the
+  histogram, clipping marks, color picker and brush auto-mask work unchanged. No
+  GPU, an image larger than the device can hold, or any GPU error drops back to the
+  CPU (an error for the rest of the session, until **Use GPU** is toggled).
+  Parity tests render the same edits both ways and require agreement to within one
+  8-bit step.
 - **Full-res zoom**: when the view outgrows the preview, the app requests just the
   visible rectangle. The worker bilinear-samples that region from the (cached,
   geometry-applied) full-resolution image at exactly the on-screen pixel density —
   cost scales with the viewport, not the photo — then runs the same pipeline on it.
-  Position-dependent ops stay correct because the render carries a `RenderCtx`
-  mapping the region back into full-image coordinates (vignette) and an equivalent
-  radius scale (texture/clarity).
+  On the GPU the full-resolution image stays resident, so panning only resamples it
+  there. Position-dependent ops stay correct because the render carries a
+  `RenderCtx` mapping the region back into full-image coordinates (vignette, masks)
+  and an equivalent radius scale (texture/clarity).
 - **Export** runs the identical pipeline once at full resolution, so what you see is
-  what you get.
+  what you get. On the GPU a full-resolution working set won't fit in one go, so
+  export renders **tiles**, each grown by a *halo*: the furthest any finished pixel
+  reaches back through the chain of blurs and noise filters (`StageRadii::halo`).
+  Every spatial stage clamps at the edge of its buffer, so that clamping lands in
+  the halo and never reaches the kept middle of a tile — the tiled result is the
+  full-frame result, which a CPU test proves by tiling the CPU pipeline itself.
+  Batch export opens its own GPU renderer, so it never competes with the preview.
 
 ### Sidecar format
 

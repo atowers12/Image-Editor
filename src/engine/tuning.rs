@@ -35,6 +35,9 @@ pub struct Tuning {
     /// fit-to-window view but slower slider response. Applied when a photo
     /// is (re)loaded.
     pub preview_edge: u32,
+    /// Render on the GPU when there is one. The CPU pipeline is always there
+    /// as the fallback; this switches to it on purpose.
+    pub use_gpu: bool,
 }
 
 impl Default for Tuning {
@@ -51,6 +54,7 @@ impl Default for Tuning {
             vignette_midpoint: 0.35,
             vignette_feather: 0.65,
             preview_edge: 1600,
+            use_gpu: true,
         }
     }
 }
@@ -99,5 +103,7 @@ mod tests {
         let partial: Tuning = serde_json::from_str(r#"{"dehaze_strength": 0.5}"#).unwrap();
         assert_eq!(partial.dehaze_strength, 0.5);
         assert_eq!(partial.preview_edge, 1600);
+        // Settings saved before the GPU pipeline existed turn it on.
+        assert!(partial.use_gpu);
     }
 }
